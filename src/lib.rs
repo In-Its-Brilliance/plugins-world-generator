@@ -1,14 +1,14 @@
-use common::plugin_api::BrilliancePlugin;
+use common::{
+    event_handler,
+    plugin_api::events::{plugin_load::PluginLoadEvent, plugin_unload::PluginUnloadEvent},
+};
 
-struct WorldGenerator;
-
-impl BrilliancePlugin for WorldGenerator {
-    fn on_enable() {
-        extism_pdk::log!(extism_pdk::LogLevel::Info, "World Generator enabled!");
-    }
-
-    fn on_disable() {
-    }
+#[event_handler]
+pub fn on_plugin_load(event: PluginLoadEvent) {
+    extism_pdk::log!(extism_pdk::LogLevel::Info, "World Generator enabled!");
 }
 
-common::brilliance_plugin!(WorldGenerator);
+#[event_handler]
+pub fn on_plugin_unload(event: PluginUnloadEvent) {
+    extism_pdk::log!(extism_pdk::LogLevel::Info, "World Generator disabled!");
+}
