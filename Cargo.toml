@@ -1,0 +1,13 @@
+[package]
+name = "inits-world-generator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+common = { git = "https://github.com/In-Its-Brilliance/brilliance-common", default-features = false, features = ["wasm-plugin"] }
+extism-pdk = "1"
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["custom"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
