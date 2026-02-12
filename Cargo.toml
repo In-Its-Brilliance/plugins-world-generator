@@ -11,3 +11,10 @@ common = { git = "https://github.com/In-Its-Brilliance/brilliance-common", defau
 extism-pdk = "1"
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["custom"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+fastnoise-lite = { version = "1", default-features = false, features = ["libm"] }
+rand = { version = "0.8", features = ["small_rng"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-inline-default = "0.2"
