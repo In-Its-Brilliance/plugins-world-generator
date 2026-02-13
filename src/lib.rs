@@ -42,8 +42,8 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
     let chunk_position = event.get_chunk_position();
     let world_settings = event.get_world_settings();
 
-    let macro_data: MacroData = serde_json::from_value(
-        world_settings.get_world_macro_data().get_data().clone()
+    let macro_data: MacroData = serde_yaml::from_value(
+        serde_yaml::to_value(world_settings.get_world_macro_data().get_data()).unwrap()
     ).map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
 
     let mut chunk_data = ChunkData::default();

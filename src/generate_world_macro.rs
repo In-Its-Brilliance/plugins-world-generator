@@ -3,7 +3,6 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
-use serde_json::Value;
 
 #[serde_inline_default]
 #[derive(Serialize, Deserialize)]
@@ -25,9 +24,9 @@ pub struct GeneratorSettings {
 }
 
 impl GeneratorSettings {
-    pub fn from_option(settings: &Option<Value>) -> Self {
+    pub fn from_option(settings: &Option<serde_yaml::Value>) -> Self {
         match settings {
-            Some(value) => serde_json::from_value(value.clone()).unwrap_or_default(),
+            Some(value) => serde_yaml::from_value(value.clone()).unwrap_or_default(),
             None => Self::default(),
         }
     }
@@ -35,7 +34,7 @@ impl GeneratorSettings {
 
 impl Default for GeneratorSettings {
     fn default() -> Self {
-        serde_json::from_value(Value::Object(Default::default())).unwrap()
+        serde_yaml::from_value(serde_yaml::Value::Mapping(Default::default())).unwrap()
     }
 }
 
@@ -55,7 +54,7 @@ pub struct MacroData {
     pub islands: Vec<IslandMacro>,
 }
 
-pub fn generate_world_macro(seed: u64, settings: &Option<Value>) -> WorldMacroData {
+pub fn generate_world_macro(seed: u64, settings: &Option<serde_yaml::Value>) -> WorldMacroData {
     let settings = GeneratorSettings::from_option(settings);
     let mut rng = SmallRng::seed_from_u64(seed);
 
@@ -88,6 +87,6 @@ pub fn generate_world_macro(seed: u64, settings: &Option<Value>) -> WorldMacroDa
         islands,
     };
 
-    let json = serde_json::to_value(&macro_data).unwrap();
-    WorldMacroData::create(json)
+    let data = serde_yaml::to_value(&macro_data).unwrap();
+    WorldMacroData::create(data)
 }

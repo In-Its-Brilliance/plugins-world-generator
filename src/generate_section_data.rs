@@ -32,7 +32,7 @@ pub fn generate_section_data(
                 let block = pick_block(world_y, height, macro_data.sea_level as i32);
                 if let Some(block_id) = block {
                     let pos = ChunkBlockPosition::new(x, y, z);
-                    section_data.insert(&pos, BlockDataInfo::create(block_id, None));
+                    section_data.insert(&pos, BlockDataInfo::create(block_id));
                 }
             }
         }
