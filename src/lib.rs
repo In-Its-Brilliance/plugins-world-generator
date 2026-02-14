@@ -8,18 +8,14 @@ use common::{
     VERTICAL_SECTIONS,
 };
 use extism_pdk::Error;
-use generate_section_data::generate_section_data;
-use generate_world_macro::{generate_world_macro, MacroData};
+use generate_section_data::{generate_section_data, MacroData};
+use generate_world_macro::{generate_world_macro};
+use settings::GeneratorSettings;
 
 mod generate_section_data;
 mod generate_world_macro;
-
-/// Two-tier generation: macro-level stores island positions and parameters,
-/// micro-level computes terrain per chunk.
-///
-/// Macro data is compact and does not grow with world size.
-/// Islands define landmass shape only — biomes are computed per-chunk
-/// via temperature/moisture noise combined with elevation.
+mod settings;
+mod utils;
 
 #[event_handler]
 pub fn on_plugin_load(event: PluginLoadEvent) -> Result<(), Error> {
@@ -33,7 +29,9 @@ pub fn on_plugin_load(event: PluginLoadEvent) -> Result<(), Error> {
 
 #[event_handler]
 pub fn on_generate_world_macro(event: GenerateWorldMacroEvent) -> Result<WorldMacroData, Error> {
-    let world_macro_data = generate_world_macro(event.get_seed(), event.get_settings());
+    let settings = GeneratorSettings::from_option(event.get_settings());
+
+    let world_macro_data = generate_world_macro(event.get_seed(), &settings);
     Ok(world_macro_data)
 }
 
@@ -42,13 +40,16 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
     let chunk_position = event.get_chunk_position();
     let world_settings = event.get_world_settings();
 
+    let settings = GeneratorSettings::from_option(world_settings.get_settings());
+
     let macro_data: MacroData = serde_yaml::from_value(
-        serde_yaml::to_value(world_settings.get_world_macro_data().get_data()).unwrap()
-    ).map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
+        serde_yaml::to_value(world_settings.get_world_macro_data().get_data()).unwrap(),
+    )
+    .map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
 
     let mut chunk_data = ChunkData::default();
     for y in 0..VERTICAL_SECTIONS {
-        let chunk_section = generate_section_data(&chunk_position, y, &macro_data);
+        let chunk_section = generate_section_data(&chunk_position, y, &macro_data, &settings);
         chunk_data.push_section(chunk_section);
     }
 

@@ -126,6 +126,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "delaunator"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c54f860fe2de6546eeb5fc7f959a6f84a5d86f4593c1871500dd3c98929cefbc"
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -312,6 +318,7 @@ name = "inits-world-generator"
 version = "0.1.0"
 dependencies = [
  "common",
+ "delaunator",
  "extism-pdk",
  "fastnoise-lite",
  "getrandom 0.2.17",
