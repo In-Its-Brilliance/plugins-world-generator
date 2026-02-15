@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub struct GeneratorSettings {
     pub sea_level: u16,
+    /// Maximum terrain height (peaks)
+    pub max_terrain_height: u16,
     /// Controls coastline detail frequency (higher = more jagged)
     pub elevation_noise_scale: f32,
     /// Land/water threshold - higher = more water

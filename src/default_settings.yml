@@ -1,6 +1,9 @@
 # World height where terrain is generated
 sea_level: 60
 
+# Maximum terrain height (peaks will reach this Y level)
+max_terrain_height: 120
+
 # Noise frequency - LOWER = larger coastline features (0.1-1.0 for big bays)
 elevation_noise_scale: 0.3
 
