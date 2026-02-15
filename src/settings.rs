@@ -17,4 +17,6 @@ pub struct GeneratorSettings {
     pub edge_threshold: f32,
     /// Cell point jitter (0.0 = grid, 0.5 = max randomness)
     pub jitter: f32,
+    /// Noise octaves for smoke-like detail (1 = blob, 4-6 = wispy smoke)
+    pub noise_octaves: u32,
 }

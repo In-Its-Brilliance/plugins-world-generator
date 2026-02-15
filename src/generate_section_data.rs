@@ -58,7 +58,7 @@ pub fn generate_section_data(
             // Runtime Voronoi computation
             let voronoi = find_nearest_cells(macro_data.seed, world_x + 0.5, world_z + 0.5, settings.jitter);
             let is_edge = is_on_voronoi_edge(&voronoi, settings.edge_threshold);
-            let elevation = get_cell_elevation(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter);
+            let elevation = get_cell_elevation(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter, settings.noise_octaves);
 
             // Get block based on elevation gradient
             let block = elevation_to_block(elevation);

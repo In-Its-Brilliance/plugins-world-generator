@@ -21,3 +21,6 @@ edge_threshold: 0.7
 
 # Cell point randomness (0.0 = regular grid, 0.5 = maximum jitter)
 jitter: 0.4
+
+# Noise octaves - more octaves = more wispy/smoke-like detail (1 = blob, 4-6 = smoke)
+noise_octaves: 4

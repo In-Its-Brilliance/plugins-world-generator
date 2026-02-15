@@ -116,15 +116,17 @@ fn fbm_noise(noise: &FastNoiseLite, x: f32, z: f32, octaves: u32) -> f32 {
 
 /// Get cell elevation (0.0 = deep water, 1.0 = high mountains)
 /// shape_roundness controls: 0 = pure fractal, 1 = circular
-pub fn get_cell_elevation(seed: u64, cell: (i32, i32), noise_scale: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32) -> f32 {
+pub fn get_cell_elevation(seed: u64, cell: (i32, i32), noise_scale: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32, noise_octaves: u32) -> f32 {
     let center = get_cell_point(seed, cell.0, cell.1, jitter);
 
-    // Sample noise at WORLD coordinates
+    // Sample FBM noise at WORLD coordinates for smoke-like detail
     // noise_scale controls feature size: higher = smaller features
+    // noise_octaves adds fine detail layers (more octaves = more wispy)
     let mut noise = FastNoiseLite::with_seed(seed as i32);
     noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-    noise.set_frequency(Some(noise_scale * 0.01)); // Direct frequency control
-    let noise_val = noise.get_noise_2d(center.0, center.1);
+    noise.set_frequency(Some(noise_scale * 0.01)); // Base frequency
+
+    let noise_val = fbm_noise(&noise, center.0, center.1, noise_octaves);
     let noise_normalized = (noise_val + 1.0) / 2.0; // 0 to 1
 
     // Distance from origin, normalized to island_radius
@@ -150,6 +152,6 @@ pub fn get_cell_elevation(seed: u64, cell: (i32, i32), noise_scale: f32, island_
 }
 
 /// Determine if a cell is land based on elevation threshold
-pub fn is_cell_land(seed: u64, cell: (i32, i32), noise_scale: f32, water_threshold: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32) -> bool {
-    get_cell_elevation(seed, cell, noise_scale, island_radius, ocean_ratio, shape_roundness, jitter) > water_threshold
+pub fn is_cell_land(seed: u64, cell: (i32, i32), noise_scale: f32, water_threshold: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32, noise_octaves: u32) -> bool {
+    get_cell_elevation(seed, cell, noise_scale, island_radius, ocean_ratio, shape_roundness, jitter, noise_octaves) > water_threshold
 }
