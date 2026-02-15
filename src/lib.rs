@@ -16,6 +16,7 @@ mod generate_section_data;
 mod generate_world_macro;
 mod settings;
 mod utils;
+mod voronoi;
 
 #[event_handler]
 pub fn on_plugin_load(event: PluginLoadEvent) -> Result<(), Error> {
@@ -29,9 +30,7 @@ pub fn on_plugin_load(event: PluginLoadEvent) -> Result<(), Error> {
 
 #[event_handler]
 pub fn on_generate_world_macro(event: GenerateWorldMacroEvent) -> Result<WorldMacroData, Error> {
-    let settings = GeneratorSettings::from_option(event.get_settings());
-
-    let world_macro_data = generate_world_macro(event.get_seed(), &settings);
+    let world_macro_data = generate_world_macro(event.get_seed());
     Ok(world_macro_data)
 }
 
@@ -49,9 +48,8 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
 
     extism_pdk::log!(
         extism_pdk::LogLevel::Debug,
-        "MacroData: {} points, {} triangles",
-        macro_data.points.len(),
-        macro_data.triangles.len()
+        "MacroData seed: {}",
+        macro_data.seed
     );
 
     let mut chunk_data = ChunkData::default();
