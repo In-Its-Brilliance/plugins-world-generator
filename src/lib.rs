@@ -46,12 +46,6 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
     )
     .map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
 
-    extism_pdk::log!(
-        extism_pdk::LogLevel::Debug,
-        "MacroData seed: {}",
-        macro_data.seed
-    );
-
     let mut chunk_data = ChunkData::default();
     for y in 0..VERTICAL_SECTIONS {
         let chunk_section = generate_section_data(&chunk_position, y, &macro_data, &settings);
