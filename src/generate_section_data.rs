@@ -10,12 +10,35 @@ use common::{
 
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
-use crate::voronoi::{find_nearest_cells, is_at_cell_center, is_cell_land, is_on_voronoi_edge};
+use crate::voronoi::{find_nearest_cells, get_cell_elevation, is_on_voronoi_edge};
 
-const GROUND_LEVEL: usize = 60;
-const EDGE_THRESHOLD: f32 = 0.7;
+/// Map elevation (0-1) to block type for gradient visualization
+/// Dark (low) -> Light (high)
+fn elevation_to_block(elevation: f32) -> BlockID {
+    if elevation < 0.1 {
+        BlockID::Bedrock // Darkest - deep water
+    } else if elevation < 0.2 {
+        BlockID::Blackstone
+    } else if elevation < 0.3 {
+        BlockID::Deepslate // Water threshold
+    } else if elevation < 0.4 {
+        BlockID::Andesite
+    } else if elevation < 0.5 {
+        BlockID::Cobblestone
+    } else if elevation < 0.6 {
+        BlockID::Stone
+    } else if elevation < 0.7 {
+        BlockID::Gravel
+    } else if elevation < 0.8 {
+        BlockID::Sand
+    } else if elevation < 0.9 {
+        BlockID::Sandstone
+    } else {
+        BlockID::SmoothStone // Brightest - mountain peaks
+    }
+}
 
-/// Runtime Voronoi visualization with Land/Water
+/// Runtime Voronoi visualization with elevation gradient
 pub fn generate_section_data(
     chunk_position: &ChunkPosition,
     vertical_index: usize,
@@ -26,7 +49,6 @@ pub fn generate_section_data(
 
     let chunk_x = chunk_position.x as f32 * CHUNK_SIZE as f32;
     let chunk_z = chunk_position.z as f32 * CHUNK_SIZE as f32;
-    let world_radius = settings.world_size / 2.0;
 
     for x in 0_u8..(CHUNK_SIZE as u8) {
         for z in 0_u8..(CHUNK_SIZE as u8) {
@@ -34,33 +56,22 @@ pub fn generate_section_data(
             let world_z = chunk_z + z as f32;
 
             // Runtime Voronoi computation
-            let voronoi = find_nearest_cells(macro_data.seed, world_x + 0.5, world_z + 0.5);
-            let is_edge = is_on_voronoi_edge(&voronoi, EDGE_THRESHOLD);
-            let is_center = is_at_cell_center(world_x, world_z, voronoi.nearest);
-            let is_land = is_cell_land(macro_data.seed, voronoi.nearest_cell, world_radius);
+            let voronoi = find_nearest_cells(macro_data.seed, world_x + 0.5, world_z + 0.5, settings.jitter);
+            let is_edge = is_on_voronoi_edge(&voronoi, settings.edge_threshold);
+            let elevation = get_cell_elevation(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter);
+
+            // Get block based on elevation gradient
+            let block = elevation_to_block(elevation);
 
             for y in 0_u8..(CHUNK_SIZE as u8) {
                 let y_global = y as usize + (vertical_index * CHUNK_SIZE as usize);
                 let pos = ChunkBlockPosition::new(x, y, z);
 
-                if y_global < GROUND_LEVEL {
-                    if is_land {
-                        section_data.insert(&pos, BlockDataInfo::create(BlockID::Grass.id()));
-                    } else {
-                        section_data.insert(&pos, BlockDataInfo::create(BlockID::Water.id()));
-                    }
-                } else if y_global == GROUND_LEVEL {
-                    if is_center {
-                        // Cell centers - different color for land/water
-                        if is_land {
-                            section_data.insert(&pos, BlockDataInfo::create(BlockID::Stone.id()));
-                        } else {
-                            section_data.insert(&pos, BlockDataInfo::create(BlockID::Gravel.id()));
-                        }
-                    } else if is_edge {
-                        // Voronoi edges
-                        section_data.insert(&pos, BlockDataInfo::create(BlockID::Sand.id()));
-                    }
+                if y_global < settings.sea_level as usize {
+                    section_data.insert(&pos, BlockDataInfo::create(block.id()));
+                } else if y_global == settings.sea_level as usize && is_edge {
+                    // Voronoi edges for visualization
+                    section_data.insert(&pos, BlockDataInfo::create(BlockID::OakPlanks.id()));
                 }
             }
         }

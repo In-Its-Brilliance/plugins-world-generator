@@ -1,2 +1,23 @@
-sea_level: 63
-world_size: 500.0
+# World height where terrain is generated
+sea_level: 60
+
+# Noise frequency - LOWER = larger coastline features (0.1-1.0 for big bays)
+elevation_noise_scale: 0.3
+
+# Land/water threshold (elevation < this = water visual)
+water_threshold: 0.5
+
+# Island radius in blocks from center (0,0)
+island_radius: 100.0
+
+# Ocean ratio - base noise threshold (higher = more water/smaller island)
+ocean_ratio: 0.5
+
+# Shape roundness: 0.0 = irregular coastline, 1.0 = circular
+shape_roundness: 0.4
+
+# Voronoi edge detection threshold for visualization
+edge_threshold: 0.7
+
+# Cell point randomness (0.0 = regular grid, 0.5 = maximum jitter)
+jitter: 0.4
