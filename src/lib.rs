@@ -8,8 +8,8 @@ use common::{
     VERTICAL_SECTIONS,
 };
 use extism_pdk::Error;
-use generate_section_data::{generate_section_data, MacroData};
-use generate_world_macro::{generate_world_macro};
+use generate_section_data::generate_section_data;
+use generate_world_macro::{generate_world_macro, MacroData};
 use settings::GeneratorSettings;
 
 mod generate_section_data;
@@ -43,9 +43,16 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
     let settings = GeneratorSettings::from_option(world_settings.get_settings());
 
     let macro_data: MacroData = serde_yaml::from_value(
-        serde_yaml::to_value(world_settings.get_world_macro_data().get_data()).unwrap(),
+        world_settings.get_world_macro_data().get_data().clone(),
     )
     .map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
+
+    extism_pdk::log!(
+        extism_pdk::LogLevel::Debug,
+        "MacroData: {} points, {} triangles",
+        macro_data.points.len(),
+        macro_data.triangles.len()
+    );
 
     let mut chunk_data = ChunkData::default();
     for y in 0..VERTICAL_SECTIONS {

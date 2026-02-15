@@ -325,7 +325,6 @@ dependencies = [
  "getrandom 0.3.4",
  "rand",
  "serde",
- "serde-inline-default",
  "serde_yaml",
 ]
 
