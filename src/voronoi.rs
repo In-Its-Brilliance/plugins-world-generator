@@ -4,6 +4,383 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 
 const CELL_SIZE: f32 = CHUNK_SIZE as f32;
 
+// ============================================================================
+// VORONOI CORNERS (Phase 1)
+// ============================================================================
+
+/// A Voronoi corner - point where 3+ cells meet
+/// This is the circumcenter of a Delaunay triangle
+#[derive(Clone, Debug)]
+pub struct VoronoiCorner {
+    /// World position of the corner
+    pub position: (f32, f32),
+    /// The three cells that share this corner (Delaunay triangle vertices)
+    pub cells: [(i32, i32); 3],
+    /// Elevation at this corner (assigned in Phase 2)
+    pub elevation: f32,
+}
+
+/// Compute circumcenter of triangle formed by three points
+/// Returns None if points are collinear
+fn circumcenter(p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> Option<(f32, f32)> {
+    let ax = p1.0;
+    let ay = p1.1;
+    let bx = p2.0;
+    let by = p2.1;
+    let cx = p3.0;
+    let cy = p3.1;
+
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+
+    // Check for collinear points
+    if d.abs() < 1e-10 {
+        return None;
+    }
+
+    let ax2_ay2 = ax * ax + ay * ay;
+    let bx2_by2 = bx * bx + by * by;
+    let cx2_cy2 = cx * cx + cy * cy;
+
+    let ux = (ax2_ay2 * (by - cy) + bx2_by2 * (cy - ay) + cx2_cy2 * (ay - by)) / d;
+    let uy = (ax2_ay2 * (cx - bx) + bx2_by2 * (ax - cx) + cx2_cy2 * (bx - ax)) / d;
+
+    Some((ux, uy))
+}
+
+/// Check if point is inside circumcircle of triangle
+fn in_circumcircle(p: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> bool {
+    let ax = p1.0 - p.0;
+    let ay = p1.1 - p.1;
+    let bx = p2.0 - p.0;
+    let by = p2.1 - p.1;
+    let cx = p3.0 - p.0;
+    let cy = p3.1 - p.1;
+
+    let det = (ax * ax + ay * ay) * (bx * cy - cx * by)
+            - (bx * bx + by * by) * (ax * cy - cx * ay)
+            + (cx * cx + cy * cy) * (ax * by - bx * ay);
+
+    det > 0.0
+}
+
+/// Find all Voronoi corners in a region around (center_x, center_z)
+/// radius is in cells (not blocks)
+pub fn find_corners_in_region(
+    seed: u64,
+    center_cell_x: i32,
+    center_cell_z: i32,
+    radius: i32,
+    jitter: f32,
+) -> Vec<VoronoiCorner> {
+    let mut corners = Vec::new();
+
+    // Collect all cells in region + buffer for edge triangles
+    let buffer = 1;
+    let min_x = center_cell_x - radius - buffer;
+    let max_x = center_cell_x + radius + buffer;
+    let min_z = center_cell_z - radius - buffer;
+    let max_z = center_cell_z + radius + buffer;
+
+    // For each potential Delaunay triangle (3 nearby cells)
+    // Check if it's a valid Delaunay triangle and compute circumcenter
+    for x1 in min_x..=max_x {
+        for z1 in min_z..=max_z {
+            let p1 = get_cell_point(seed, x1, z1, jitter);
+
+            // Check triangles with neighbors to avoid duplicates
+            // Only consider cells where (x2,z2) > (x1,z1) and (x3,z3) > (x2,z2)
+            for dx2 in 0..=2 {
+                for dz2 in -1..=2 {
+                    if dx2 == 0 && dz2 <= 0 { continue; }
+
+                    let x2 = x1 + dx2;
+                    let z2 = z1 + dz2;
+                    if x2 > max_x || z2 > max_z || z2 < min_z { continue; }
+
+                    let p2 = get_cell_point(seed, x2, z2, jitter);
+
+                    for dx3 in 0..=2 {
+                        for dz3 in -1..=2 {
+                            let x3 = x2 + dx3;
+                            let z3 = z2 + dz3;
+
+                            // Ensure (x3,z3) > (x2,z2) to avoid duplicates
+                            if x3 < x2 || (x3 == x2 && z3 <= z2) { continue; }
+                            if x3 > max_x || z3 > max_z || z3 < min_z { continue; }
+
+                            let p3 = get_cell_point(seed, x3, z3, jitter);
+
+                            // Compute circumcenter
+                            if let Some(cc) = circumcenter(p1, p2, p3) {
+                                // Check Delaunay condition: no other point inside circumcircle
+                                let mut is_delaunay = true;
+
+                                // Check nearby cells (expanded neighborhood)
+                                'outer: for cx in (x1.min(x2).min(x3) - 1)..=(x1.max(x2).max(x3) + 1) {
+                                    for cz in (z1.min(z2).min(z3) - 1)..=(z1.max(z2).max(z3) + 1) {
+                                        if (cx == x1 && cz == z1) || (cx == x2 && cz == z2) || (cx == x3 && cz == z3) {
+                                            continue;
+                                        }
+                                        let p = get_cell_point(seed, cx, cz, jitter);
+                                        if in_circumcircle(p, p1, p2, p3) {
+                                            is_delaunay = false;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+
+                                if is_delaunay {
+                                    // Check if circumcenter is within our region of interest
+                                    let cc_cell = world_to_cell(cc.0, cc.1);
+                                    if cc_cell.0 >= center_cell_x - radius
+                                        && cc_cell.0 <= center_cell_x + radius
+                                        && cc_cell.1 >= center_cell_z - radius
+                                        && cc_cell.1 <= center_cell_z + radius
+                                    {
+                                        corners.push(VoronoiCorner {
+                                            position: cc,
+                                            cells: [(x1, z1), (x2, z2), (x3, z3)],
+                                            elevation: 0.0, // Will be set in Phase 2
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    corners
+}
+
+// ============================================================================
+// CORNER ELEVATION (Phase 2)
+// ============================================================================
+
+/// Corner terrain type (determined by 3 adjacent cells)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CornerType {
+    Ocean,  // All 3 cells are water
+    Coast,  // Mix of land and water cells
+    Inland, // All 3 cells are land
+}
+
+/// Determine corner type based on its 3 adjacent cells
+pub fn get_corner_type(seed: u64, corner: &VoronoiCorner, params: &TerrainParams) -> CornerType {
+    let mut land_count = 0;
+    let mut water_count = 0;
+
+    for cell in &corner.cells {
+        if is_cell_land(
+            seed,
+            *cell,
+            params.noise_scale,
+            params.water_threshold,
+            params.island_radius,
+            params.ocean_ratio,
+            params.shape_roundness,
+            params.jitter,
+            params.noise_octaves,
+        ) {
+            land_count += 1;
+        } else {
+            water_count += 1;
+        }
+    }
+
+    if water_count == 3 {
+        CornerType::Ocean
+    } else if land_count == 3 {
+        CornerType::Inland
+    } else {
+        CornerType::Coast
+    }
+}
+
+/// Calculate elevation for a corner based on its type, world position, and noise
+/// Returns: 0.0 for ocean, 0.15 for coast, 0.2-1.0 for inland
+pub fn calculate_corner_elevation(
+    seed: u64,
+    corner: &VoronoiCorner,
+    params: &TerrainParams,
+    _max_coast_distance: u32,
+) -> f32 {
+    let corner_type = get_corner_type(seed, corner, params);
+
+    match corner_type {
+        CornerType::Ocean => 0.0,
+        CornerType::Coast => 0.08, // Beach - between ocean (0) and inland (0.2)
+        CornerType::Inland => {
+            let (x, z) = corner.position;
+
+            // Base elevation from distance to center
+            let dist_from_center = (x * x + z * z).sqrt();
+            let normalized_dist = (dist_from_center / params.island_radius).min(1.0);
+
+            // Base: 0.3 at edge, 1.0 at center
+            let base_elevation = 1.0 - normalized_dist * 0.7;
+
+            // Add noise for organic variation
+            let mut noise = FastNoiseLite::with_seed(seed as i32 + 1000);
+            noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+            noise.set_frequency(Some(0.015)); // Larger features
+
+            // Multi-octave noise
+            let noise1 = noise.get_noise_2d(x, z);
+            noise.set_frequency(Some(0.04));
+            let noise2 = noise.get_noise_2d(x, z) * 0.4;
+
+            let combined_noise = (noise1 + noise2) / 1.4; // -1 to 1
+
+            // Apply noise: 20% influence (less aggressive)
+            let elevation = base_elevation + combined_noise * 0.2;
+
+            // Clamp: minimum 0.2 to stay clearly above coast (0.15)
+            elevation.clamp(0.2, 1.0)
+        }
+    }
+}
+
+/// Assign elevations to all corners in a list
+pub fn assign_corner_elevations(
+    seed: u64,
+    corners: &mut [VoronoiCorner],
+    params: &TerrainParams,
+    max_coast_distance: u32,
+) {
+    for corner in corners.iter_mut() {
+        corner.elevation = calculate_corner_elevation(seed, corner, params, max_coast_distance);
+    }
+}
+
+/// Find the 3 nearest corners to a point (for triangulation/interpolation)
+pub fn find_nearest_corners(
+    point: (f32, f32),
+    corners: &[VoronoiCorner],
+) -> Option<[&VoronoiCorner; 3]> {
+    if corners.len() < 3 {
+        return None;
+    }
+
+    // Find corners sorted by distance
+    let mut with_dist: Vec<_> = corners.iter()
+        .map(|c| {
+            let dx = c.position.0 - point.0;
+            let dz = c.position.1 - point.1;
+            (c, dx * dx + dz * dz)
+        })
+        .collect();
+
+    with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    Some([with_dist[0].0, with_dist[1].0, with_dist[2].0])
+}
+
+// ============================================================================
+// ELEVATION INTERPOLATION (Phase 3)
+// ============================================================================
+
+/// Compute barycentric coordinates for point P in triangle (A, B, C)
+/// Returns (u, v, w) where P = u*A + v*B + w*C and u + v + w = 1
+/// Returns None if triangle is degenerate
+fn barycentric_coords(
+    p: (f32, f32),
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+) -> Option<(f32, f32, f32)> {
+    let v0 = (c.0 - a.0, c.1 - a.1);
+    let v1 = (b.0 - a.0, b.1 - a.1);
+    let v2 = (p.0 - a.0, p.1 - a.1);
+
+    let dot00 = v0.0 * v0.0 + v0.1 * v0.1;
+    let dot01 = v0.0 * v1.0 + v0.1 * v1.1;
+    let dot02 = v0.0 * v2.0 + v0.1 * v2.1;
+    let dot11 = v1.0 * v1.0 + v1.1 * v1.1;
+    let dot12 = v1.0 * v2.0 + v1.1 * v2.1;
+
+    let denom = dot00 * dot11 - dot01 * dot01;
+    if denom.abs() < 1e-10 {
+        return None; // Degenerate triangle
+    }
+
+    let inv_denom = 1.0 / denom;
+    let u = (dot11 * dot02 - dot01 * dot12) * inv_denom;
+    let v = (dot00 * dot12 - dot01 * dot02) * inv_denom;
+    let w = 1.0 - u - v;
+
+    Some((w, v, u)) // (weight for A, weight for B, weight for C)
+}
+
+/// Check if point is inside triangle using barycentric coordinates
+fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    if let Some((u, v, w)) = barycentric_coords(p, a, b, c) {
+        u >= 0.0 && v >= 0.0 && w >= 0.0
+    } else {
+        false
+    }
+}
+
+/// Interpolate elevation at a point using barycentric interpolation
+/// Falls back to inverse distance weighting if point is outside triangle
+pub fn interpolate_elevation(point: (f32, f32), corners: &[VoronoiCorner]) -> f32 {
+    if corners.is_empty() {
+        return 0.0;
+    }
+
+    // Find 3 nearest corners
+    let nearest = match find_nearest_corners(point, corners) {
+        Some(n) => n,
+        None => return corners[0].elevation,
+    };
+
+    let a = nearest[0].position;
+    let b = nearest[1].position;
+    let c = nearest[2].position;
+
+    // Try barycentric interpolation if point is inside triangle
+    if let Some((u, v, w)) = barycentric_coords(point, a, b, c) {
+        // Clamp coordinates to handle points slightly outside
+        let u = u.max(0.0);
+        let v = v.max(0.0);
+        let w = w.max(0.0);
+        let sum = u + v + w;
+
+        if sum > 0.0 {
+            let u = u / sum;
+            let v = v / sum;
+            let w = w / sum;
+            return u * nearest[0].elevation + v * nearest[1].elevation + w * nearest[2].elevation;
+        }
+    }
+
+    // Fallback: inverse distance weighting
+    let mut total_weight = 0.0;
+    let mut total_elevation = 0.0;
+
+    for corner in nearest {
+        let dx = point.0 - corner.position.0;
+        let dz = point.1 - corner.position.1;
+        let dist_sq = dx * dx + dz * dz;
+
+        if dist_sq < 0.001 {
+            return corner.elevation; // Very close to corner
+        }
+
+        let weight = 1.0 / dist_sq;
+        total_weight += weight;
+        total_elevation += weight * corner.elevation;
+    }
+
+    total_elevation / total_weight
+}
+
+// ============================================================================
+// ORIGINAL VORONOI CODE
+// ============================================================================
+
 /// Compute jittered point position for a grid cell (deterministic from seed)
 pub fn get_cell_point(seed: u64, cell_x: i32, cell_z: i32, jitter: f32) -> (f32, f32) {
     let x_bits = cell_x as u32 as u64;
@@ -388,6 +765,23 @@ pub fn generate_river_cells(params: &TerrainParams, max_depth: u32) -> std::coll
     }
 
     river_cells
+}
+
+/// Get moisture for a cell (0.0 = dry, 1.0 = wet)
+/// Moisture is based on distance from coast - coast is wet, deep inland is dry
+/// Returns: 1.0 for coast/water, decreasing towards inland
+pub fn get_cell_moisture(cell: (i32, i32), params: &TerrainParams, max_depth: u32) -> f32 {
+    // Water cells are maximally wet
+    if params.is_water(cell) {
+        return 1.0;
+    }
+
+    let coast_distance = get_coast_distance(cell, params, max_depth);
+
+    // Invert: coast (0) = 1.0 moisture, max_depth = 0.0 moisture
+    // Use quadratic falloff for more realistic moisture distribution
+    let normalized = 1.0 - (coast_distance as f32 / max_depth as f32);
+    normalized * normalized // Quadratic falloff - moisture drops faster inland
 }
 
 /// Check if a land cell is on the coastline (has water neighbor)

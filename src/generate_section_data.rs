@@ -10,55 +10,33 @@ use common::{
 
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
-use crate::voronoi::{find_nearest_cells, get_cell_type, get_coast_distance, is_on_voronoi_edge, CellType, TerrainParams};
+use crate::voronoi::{
+    find_nearest_cells, is_on_voronoi_edge,
+    find_corners_in_region, world_to_cell, assign_corner_elevations, interpolate_elevation,
+    TerrainParams,
+};
 
-/// Map elevation (0-1) to block type for gradient visualization
-/// Dark (low) -> Light (high)
-fn elevation_to_block(elevation: f32) -> BlockID {
-    if elevation < 0.1 {
-        BlockID::Bedrock // Darkest - deep water
-    } else if elevation < 0.2 {
-        BlockID::Blackstone
-    } else if elevation < 0.3 {
-        BlockID::Deepslate // Water threshold
-    } else if elevation < 0.4 {
-        BlockID::Andesite
-    } else if elevation < 0.5 {
-        BlockID::Cobblestone
-    } else if elevation < 0.6 {
-        BlockID::Stone
-    } else if elevation < 0.7 {
-        BlockID::Gravel
-    } else if elevation < 0.8 {
-        BlockID::Sand
-    } else if elevation < 0.9 {
-        BlockID::Sandstone
+/// Map interpolated elevation to block type for visualization
+/// Ocean (0.0) -> Coast (0.08) -> Inland (0.2-1.0)
+fn interpolated_elevation_to_block(elevation: f32) -> BlockID {
+    if elevation < 0.03 {
+        BlockID::Deepslate // Ocean only (very close to 0.0)
+    } else if elevation < 0.12 {
+        BlockID::Sand // Beach - only near coast corners (0.08)
+    } else if elevation < 0.30 {
+        BlockID::Grass // Plains
+    } else if elevation < 0.50 {
+        BlockID::Podzol // Forest
+    } else if elevation < 0.70 {
+        BlockID::Stone // Hills
+    } else if elevation < 0.88 {
+        BlockID::Gravel // Mountains
     } else {
-        BlockID::SmoothStone // Brightest - mountain peaks
+        BlockID::SmoothStone // Peaks
     }
 }
 
-/// Map coast distance (0-max) to elevation for land visualization
-/// Coast = low, far inland = high (mountains)
-fn coast_distance_to_block(distance: u32, max_distance: u32) -> BlockID {
-    let normalized = (distance as f32) / (max_distance as f32);
-    // Map 0-1 to land blocks (starting from coast level)
-    if normalized < 0.15 {
-        BlockID::Sand           // Beach/coast
-    } else if normalized < 0.3 {
-        BlockID::Grass          // Low plains
-    } else if normalized < 0.5 {
-        BlockID::Podzol         // Forest
-    } else if normalized < 0.7 {
-        BlockID::Stone          // Hills
-    } else if normalized < 0.85 {
-        BlockID::Gravel         // Mountains
-    } else {
-        BlockID::SmoothStone    // Peaks
-    }
-}
-
-/// Runtime Voronoi visualization with elevation gradient
+/// Runtime Voronoi visualization with corners
 pub fn generate_section_data(
     chunk_position: &ChunkPosition,
     vertical_index: usize,
@@ -82,37 +60,47 @@ pub fn generate_section_data(
         noise_octaves: settings.noise_octaves,
     };
 
-    const MAX_COAST_DISTANCE: u32 = 10; // Max search depth for BFS
+    const MAX_COAST_DISTANCE: u32 = 10;
+
+    // Compute corners for this chunk area (+ buffer)
+    let center_cell = world_to_cell(chunk_x + CHUNK_SIZE as f32 / 2.0, chunk_z + CHUNK_SIZE as f32 / 2.0);
+    let mut corners = find_corners_in_region(
+        macro_data.seed,
+        center_cell.0,
+        center_cell.1,
+        2, // radius in cells
+        settings.jitter,
+    );
+
+    // Phase 2: Assign elevations to corners
+    assign_corner_elevations(macro_data.seed, &mut corners, &terrain_params, MAX_COAST_DISTANCE);
 
     for x in 0_u8..(CHUNK_SIZE as u8) {
         for z in 0_u8..(CHUNK_SIZE as u8) {
             let world_x = chunk_x + x as f32;
             let world_z = chunk_z + z as f32;
+            let world_point = (world_x + 0.5, world_z + 0.5);
 
-            // Runtime Voronoi computation
-            let voronoi = find_nearest_cells(macro_data.seed, world_x + 0.5, world_z + 0.5, settings.jitter);
+            // Phase 3: Interpolate elevation from corners
+            let elevation = interpolate_elevation(world_point, &corners);
+            let block = interpolated_elevation_to_block(elevation);
+
+            // Optional: still detect edges for visualization
+            let voronoi = find_nearest_cells(macro_data.seed, world_point.0, world_point.1, settings.jitter);
             let is_edge = is_on_voronoi_edge(&voronoi, settings.edge_threshold);
-            let cell_type = get_cell_type(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.water_threshold, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter, settings.noise_octaves);
-
-            // Get block based on cell type (no rivers for now)
-            let block = match cell_type {
-                CellType::Ocean => BlockID::Bedrock,  // Uniform dark ocean
-                CellType::Coast => BlockID::Sand,  // Beach
-                CellType::Inland => {
-                    let coast_dist = get_coast_distance(voronoi.nearest_cell, &terrain_params, MAX_COAST_DISTANCE);
-                    coast_distance_to_block(coast_dist, MAX_COAST_DISTANCE)
-                }
-            };
 
             for y in 0_u8..(CHUNK_SIZE as u8) {
                 let y_global = y as usize + (vertical_index * CHUNK_SIZE as usize);
                 let pos = ChunkBlockPosition::new(x, y, z);
 
                 if y_global < settings.sea_level as usize {
+                    // Use interpolated elevation for terrain color
                     section_data.insert(&pos, BlockDataInfo::create(block.id()));
-                } else if y_global == settings.sea_level as usize && is_edge {
-                    // Voronoi edges for visualization
-                    section_data.insert(&pos, BlockDataInfo::create(BlockID::OakPlanks.id()));
+                } else if y_global == settings.sea_level as usize {
+                    // Show edges on top layer
+                    if is_edge {
+                        section_data.insert(&pos, BlockDataInfo::create(BlockID::OakPlanks.id()));
+                    }
                 }
             }
         }
