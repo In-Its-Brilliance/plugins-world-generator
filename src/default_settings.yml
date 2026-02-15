@@ -5,7 +5,8 @@ sea_level: 60
 elevation_noise_scale: 0.3
 
 # Land/water threshold (elevation < this = water visual)
-water_threshold: 0.5
+# Lower = larger island. 0.2 = only black is ocean, gray+ is land
+water_threshold: 0.2
 
 # Island radius in blocks from center (0,0)
 island_radius: 100.0

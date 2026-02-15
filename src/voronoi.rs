@@ -155,3 +155,39 @@ pub fn get_cell_elevation(seed: u64, cell: (i32, i32), noise_scale: f32, island_
 pub fn is_cell_land(seed: u64, cell: (i32, i32), noise_scale: f32, water_threshold: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32, noise_octaves: u32) -> bool {
     get_cell_elevation(seed, cell, noise_scale, island_radius, ocean_ratio, shape_roundness, jitter, noise_octaves) > water_threshold
 }
+
+/// Cell terrain type
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellType {
+    Ocean,      // Deep water far from land
+    Coast,      // Land cell adjacent to water
+    Inland,     // Land cell surrounded by land
+}
+
+/// Check if a land cell is on the coastline (has water neighbor)
+/// Returns CellType based on cell's position relative to water
+pub fn get_cell_type(seed: u64, cell: (i32, i32), noise_scale: f32, water_threshold: f32, island_radius: f32, ocean_ratio: f32, shape_roundness: f32, jitter: f32, noise_octaves: u32) -> CellType {
+    let elevation = get_cell_elevation(seed, cell, noise_scale, island_radius, ocean_ratio, shape_roundness, jitter, noise_octaves);
+
+    // Water cell
+    if elevation <= water_threshold {
+        return CellType::Ocean;
+    }
+
+    // Land cell - check if any neighbor is water (8-directional)
+    const NEIGHBORS: [(i32, i32); 8] = [
+        (-1, -1), (0, -1), (1, -1),
+        (-1,  0),          (1,  0),
+        (-1,  1), (0,  1), (1,  1),
+    ];
+
+    for (dx, dz) in NEIGHBORS {
+        let neighbor = (cell.0 + dx, cell.1 + dz);
+        let neighbor_elevation = get_cell_elevation(seed, neighbor, noise_scale, island_radius, ocean_ratio, shape_roundness, jitter, noise_octaves);
+        if neighbor_elevation <= water_threshold {
+            return CellType::Coast;
+        }
+    }
+
+    CellType::Inland
+}

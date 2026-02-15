@@ -10,7 +10,7 @@ use common::{
 
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
-use crate::voronoi::{find_nearest_cells, get_cell_elevation, is_on_voronoi_edge};
+use crate::voronoi::{find_nearest_cells, get_cell_elevation, get_cell_type, is_on_voronoi_edge, CellType};
 
 /// Map elevation (0-1) to block type for gradient visualization
 /// Dark (low) -> Light (high)
@@ -59,9 +59,14 @@ pub fn generate_section_data(
             let voronoi = find_nearest_cells(macro_data.seed, world_x + 0.5, world_z + 0.5, settings.jitter);
             let is_edge = is_on_voronoi_edge(&voronoi, settings.edge_threshold);
             let elevation = get_cell_elevation(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter, settings.noise_octaves);
+            let cell_type = get_cell_type(macro_data.seed, voronoi.nearest_cell, settings.elevation_noise_scale, settings.water_threshold, settings.island_radius, settings.ocean_ratio, settings.shape_roundness, settings.jitter, settings.noise_octaves);
 
-            // Get block based on elevation gradient
-            let block = elevation_to_block(elevation);
+            // Get block based on cell type and elevation
+            let block = match cell_type {
+                CellType::Ocean => elevation_to_block(elevation),
+                CellType::Coast => BlockID::AmethystBlock,  // Bright coastline for visibility
+                CellType::Inland => elevation_to_block(elevation),
+            };
 
             for y in 0_u8..(CHUNK_SIZE as u8) {
                 let y_global = y as usize + (vertical_index * CHUNK_SIZE as usize);
