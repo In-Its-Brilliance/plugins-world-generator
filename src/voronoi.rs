@@ -156,91 +156,76 @@ pub fn find_corners_in_region(
 }
 
 // ============================================================================
-// CORNER ELEVATION (Phase 2)
+// CORNER ELEVATION (Phase 2) - Continuous heightmap approach
 // ============================================================================
 
-/// Corner terrain type (determined by 3 adjacent cells)
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CornerType {
-    Ocean,  // All 3 cells are water
-    Coast,  // Mix of land and water cells
-    Inland, // All 3 cells are land
-}
+/// Calculate elevation at any world position using continuous noise field
+/// Returns: 0.0-1.0 where < water_threshold = water, >= water_threshold = land
+/// Coastline is implicitly defined where elevation crosses water_threshold
+pub fn get_continuous_elevation(
+    x: f32,
+    z: f32,
+    params: &TerrainParams,
+) -> f32 {
+    // Sample FBM noise at world coordinates
+    let mut noise = FastNoiseLite::with_seed(params.seed as i32);
+    noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+    noise.set_frequency(Some(params.noise_scale * 0.01));
 
-/// Determine corner type based on its 3 adjacent cells
-pub fn get_corner_type(seed: u64, corner: &VoronoiCorner, params: &TerrainParams) -> CornerType {
-    let mut land_count = 0;
-    let mut water_count = 0;
+    let noise_val = fbm_noise(&noise, x, z, params.noise_octaves);
+    let noise_normalized = (noise_val + 1.0) / 2.0; // 0 to 1
 
-    for cell in &corner.cells {
-        if is_cell_land(
-            seed,
-            *cell,
-            params.noise_scale,
-            params.water_threshold,
-            params.island_radius,
-            params.ocean_ratio,
-            params.shape_roundness,
-            params.jitter,
-            params.noise_octaves,
-        ) {
-            land_count += 1;
-        } else {
-            water_count += 1;
-        }
-    }
+    // Distance from origin, normalized to island_radius
+    let dist = (x * x + z * z).sqrt() / params.island_radius;
 
-    if water_count == 3 {
-        CornerType::Ocean
-    } else if land_count == 3 {
-        CornerType::Inland
+    // shape_roundness controls distance influence on the shape
+    let dist_strength = 0.2 + params.shape_roundness * 0.8;
+    let threshold = params.ocean_ratio * (1.0 + dist * dist * dist_strength);
+
+    // Base elevation using internal 0.5 boundary (same as original get_cell_elevation)
+    // This gives smooth continuous values that can be compared against water_threshold
+    let base_elevation = if noise_normalized > threshold {
+        // Land: scale to 0.5-1.0 range
+        // excess shows how far above threshold - small island = small excess = low mountains
+        let excess = (noise_normalized - threshold) / (1.0 - threshold).max(0.01);
+        // Quadratic: mountains only form deep inside landmass
+        // excess=0.2 → 0.02, excess=0.5 → 0.125, excess=1.0 → 0.5
+        0.5 + excess * excess * 0.5
     } else {
-        CornerType::Coast
+        // Water: scale to 0.0-0.5 range
+        let deficit = (threshold - noise_normalized) / threshold.max(0.01);
+        (0.5 - deficit * 0.5).max(0.0)
+    };
+
+    // Add terrain detail noise (amplitude grows with elevation above water)
+    let mut detail_noise = FastNoiseLite::with_seed(params.seed as i32 + 1000);
+    detail_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+    detail_noise.set_frequency(Some(0.02));
+
+    let detail = detail_noise.get_noise_2d(x, z); // -1 to 1
+
+    // Detail only affects land areas, proportional to elevation
+    if base_elevation > params.water_threshold {
+        let land_height = base_elevation - params.water_threshold;
+        let detail_amplitude = land_height * 0.15;
+        (base_elevation + detail * detail_amplitude).clamp(params.water_threshold, 1.0)
+    } else {
+        // Underwater: subtle ocean floor variation
+        let floor_variation = detail * 0.02;
+        (base_elevation + floor_variation).clamp(0.0, params.water_threshold - 0.01)
     }
 }
 
-/// Calculate elevation for a corner based on its type, world position, and noise
-/// Returns: 0.0 for ocean, 0.15 for coast, 0.2-1.0 for inland
+/// Calculate elevation for a corner directly from continuous noise field
+/// No more CornerType - coastline is defined by elevation isoline
 pub fn calculate_corner_elevation(
-    seed: u64,
+    _seed: u64,
     corner: &VoronoiCorner,
     params: &TerrainParams,
     _max_coast_distance: u32,
 ) -> f32 {
-    let corner_type = get_corner_type(seed, corner, params);
-
-    match corner_type {
-        CornerType::Ocean => 0.0,
-        CornerType::Coast => 0.08, // Beach - between ocean (0) and inland (0.2)
-        CornerType::Inland => {
-            let (x, z) = corner.position;
-
-            // Base elevation from distance to center
-            let dist_from_center = (x * x + z * z).sqrt();
-            let normalized_dist = (dist_from_center / params.island_radius).min(1.0);
-
-            // Base: 0.3 at edge, 1.0 at center
-            let base_elevation = 1.0 - normalized_dist * 0.7;
-
-            // Add noise for organic variation
-            let mut noise = FastNoiseLite::with_seed(seed as i32 + 1000);
-            noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-            noise.set_frequency(Some(0.015)); // Larger features
-
-            // Multi-octave noise
-            let noise1 = noise.get_noise_2d(x, z);
-            noise.set_frequency(Some(0.04));
-            let noise2 = noise.get_noise_2d(x, z) * 0.4;
-
-            let combined_noise = (noise1 + noise2) / 1.4; // -1 to 1
-
-            // Apply noise: 20% influence (less aggressive)
-            let elevation = base_elevation + combined_noise * 0.2;
-
-            // Clamp: minimum 0.2 to stay clearly above coast (0.15)
-            elevation.clamp(0.2, 1.0)
-        }
-    }
+    let (x, z) = corner.position;
+    get_continuous_elevation(x, z, params)
 }
 
 /// Assign elevations to all corners in a list
@@ -323,53 +308,46 @@ fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32))
     }
 }
 
-/// Interpolate elevation at a point using barycentric interpolation
-/// Falls back to inverse distance weighting if point is outside triangle
+/// Interpolate elevation at a point using inverse distance weighting (IDW)
+/// Uses multiple nearest corners for smooth interpolation without discontinuities
 pub fn interpolate_elevation(point: (f32, f32), corners: &[VoronoiCorner]) -> f32 {
     if corners.is_empty() {
         return 0.0;
     }
 
-    // Find 3 nearest corners
-    let nearest = match find_nearest_corners(point, corners) {
-        Some(n) => n,
-        None => return corners[0].elevation,
-    };
-
-    let a = nearest[0].position;
-    let b = nearest[1].position;
-    let c = nearest[2].position;
-
-    // Try barycentric interpolation if point is inside triangle
-    if let Some((u, v, w)) = barycentric_coords(point, a, b, c) {
-        // Clamp coordinates to handle points slightly outside
-        let u = u.max(0.0);
-        let v = v.max(0.0);
-        let w = w.max(0.0);
-        let sum = u + v + w;
-
-        if sum > 0.0 {
-            let u = u / sum;
-            let v = v / sum;
-            let w = w / sum;
-            return u * nearest[0].elevation + v * nearest[1].elevation + w * nearest[2].elevation;
-        }
+    if corners.len() == 1 {
+        return corners[0].elevation;
     }
 
-    // Fallback: inverse distance weighting
+    // Find N nearest corners sorted by distance
+    const NUM_NEIGHBORS: usize = 6;
+
+    let mut with_dist: Vec<_> = corners.iter()
+        .map(|c| {
+            let dx = c.position.0 - point.0;
+            let dz = c.position.1 - point.1;
+            (c, dx * dx + dz * dz)
+        })
+        .collect();
+
+    with_dist.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    // IDW with smoothing power (higher = sharper transitions)
+    const IDW_POWER: f32 = 2.0;
+
     let mut total_weight = 0.0;
     let mut total_elevation = 0.0;
 
-    for corner in nearest {
-        let dx = point.0 - corner.position.0;
-        let dz = point.1 - corner.position.1;
-        let dist_sq = dx * dx + dz * dz;
+    let count = with_dist.len().min(NUM_NEIGHBORS);
+    for i in 0..count {
+        let (corner, dist_sq) = with_dist[i];
 
         if dist_sq < 0.001 {
             return corner.elevation; // Very close to corner
         }
 
-        let weight = 1.0 / dist_sq;
+        // IDW weight: 1 / distance^power
+        let weight = 1.0 / dist_sq.powf(IDW_POWER / 2.0);
         total_weight += weight;
         total_elevation += weight * corner.elevation;
     }

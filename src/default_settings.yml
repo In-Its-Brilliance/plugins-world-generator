@@ -15,7 +15,7 @@ water_threshold: 0.2
 island_radius: 80.0
 
 # Ocean ratio - base noise threshold (higher = more water/smaller island)
-ocean_ratio: 0.5
+ocean_ratio: 0.3
 
 # Shape roundness: 0.0 = irregular coastline, 1.0 = circular
 shape_roundness: 0.4
