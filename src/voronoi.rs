@@ -184,13 +184,15 @@ pub fn get_continuous_elevation(
     let is_land = shape_normalized > threshold;
 
     // === LAYER 2: Ridge noise for mountain ranges (MACRO structure) ===
+    // Frequency scaled to island size: ~2-3 ridges per island diameter
+    let ridge_frequency = 1.0 / (params.island_radius * 1.5);
+
     let mut height_noise = FastNoiseLite::with_seed(params.seed as i32 + 5000);
     height_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-    height_noise.set_frequency(Some(0.003)); // Very low frequency = large mountain ranges
+    height_noise.set_frequency(Some(ridge_frequency));
 
     // Ridged FBM: creates sharp mountain ridges
-    // Only 2 octaves = clean macro structure without noise
-    let ridge_value = ridged_fbm(&height_noise, x, z, 2, 0.5);
+    let ridge_value = ridged_fbm(&height_noise, x, z, 3, 0.5);
 
     if is_land {
         // Land: elevation from 0.5 to 1.0
@@ -200,32 +202,62 @@ pub fn get_continuous_elevation(
         let coast_margin = (shape_normalized - threshold) / (1.0 - threshold).max(0.01);
         let coast_margin = coast_margin.clamp(0.0, 1.0);
 
-        // Smooth transition at coastline (first ~10% of coast_margin)
-        let coast_blend = (coast_margin * 10.0).min(1.0);
+        // Smooth transition at coastline (avoid mountains right at water)
+        let coast_blend = (coast_margin * 5.0).min(1.0);
 
-        // MACRO terrain from ridges (full 0.5 range for strong elevation contrast)
-        let macro_height = ridge_value * 0.5;
+        // Base land elevation - increases as you go inland (beach → inland)
+        // This ensures flat areas inland have higher elevation than coast
+        let base_land = coast_blend * 0.1; // 0 at coast, 0.1 inland
 
-        // Micro detail noise (very subtle texture, 3-4x less than before)
+        // MACRO terrain from ridges - stronger amplitude for real mountains
+        let macro_height = ridge_value * ridge_value * 0.4; // Squared for sharper peaks
+
+        // Micro detail noise (subtle texture)
         let mut detail_noise = FastNoiseLite::with_seed(params.seed as i32 + 6000);
         detail_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-        detail_noise.set_frequency(Some(0.02));
-        let detail = detail_noise.get_noise_2d(x, z) * 0.03; // Only 3% variation
+        detail_noise.set_frequency(Some(0.015));
+        let detail = detail_noise.get_noise_2d(x, z) * 0.02;
 
-        let elevation = 0.5 + coast_blend * (macro_height + detail);
+        // Elevation: 0.5 (coast) + base_land (0-0.1) + mountains
+        let elevation = 0.5 + base_land + coast_blend * (macro_height + detail);
 
         elevation.clamp(0.5, 1.0)
     } else {
         // Water: elevation from 0.0 to 0.5
+        // deficit = how far below threshold (0 = at coast, 1 = deep ocean)
         let deficit = (threshold - shape_normalized) / threshold.max(0.01);
         let deficit = deficit.clamp(0.0, 1.0);
 
+        // Use sqrt for faster initial drop near coastline
+        // At coast (deficit=0.01): sqrt(0.01)=0.1 -> drops 10% immediately
+        // Mid ocean (deficit=0.5): sqrt(0.5)=0.7 -> 70% depth
+        let deficit_fast = deficit.sqrt();
+
         // Ocean floor with subtle variation
-        let floor_variation = ridge_value * 0.05;
-        let elevation = 0.5 - deficit * 0.4 - floor_variation;
+        let floor_variation = ridge_value * 0.03;
+        let elevation = 0.5 - deficit_fast * 0.4 - floor_variation;
 
         elevation.clamp(0.0, 0.49)
     }
+}
+
+/// Get coast margin (0.0 = at coastline, 1.0 = deep inland, negative = water)
+/// Used for beach detection - small positive values are near the coast
+pub fn get_coast_margin(x: f32, z: f32, params: &TerrainParams) -> f32 {
+    let mut shape_noise = FastNoiseLite::with_seed(params.seed as i32);
+    shape_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+    shape_noise.set_frequency(Some(params.noise_scale * 0.01));
+
+    let shape_val = fbm_noise(&shape_noise, x, z, params.noise_octaves);
+    let shape_normalized = (shape_val + 1.0) / 2.0;
+
+    let dist = (x * x + z * z).sqrt() / params.island_radius;
+    let dist_strength = 0.2 + params.shape_roundness * 0.8;
+    let threshold = params.ocean_ratio * (1.0 + dist * dist * dist_strength);
+
+    // Return raw margin (positive = land, negative = water)
+    // Normalized so ~0.1 means "10% into land area"
+    (shape_normalized - threshold) / (1.0 - threshold).max(0.01)
 }
 
 /// Calculate elevation for a corner directly from continuous noise field
