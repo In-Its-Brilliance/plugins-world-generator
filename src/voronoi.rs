@@ -167,52 +167,64 @@ pub fn get_continuous_elevation(
     z: f32,
     params: &TerrainParams,
 ) -> f32 {
-    // Sample FBM noise at world coordinates
-    let mut noise = FastNoiseLite::with_seed(params.seed as i32);
-    noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-    noise.set_frequency(Some(params.noise_scale * 0.01));
+    // === LAYER 1: Land/water mask (determines coastline shape) ===
+    let mut shape_noise = FastNoiseLite::with_seed(params.seed as i32);
+    shape_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+    shape_noise.set_frequency(Some(params.noise_scale * 0.01));
 
-    let noise_val = fbm_noise(&noise, x, z, params.noise_octaves);
-    let noise_normalized = (noise_val + 1.0) / 2.0; // 0 to 1
+    let shape_val = fbm_noise(&shape_noise, x, z, params.noise_octaves);
+    let shape_normalized = (shape_val + 1.0) / 2.0; // 0 to 1
 
-    // Distance from origin, normalized to island_radius
+    // Distance falloff - only affects edge of island
     let dist = (x * x + z * z).sqrt() / params.island_radius;
-
-    // shape_roundness controls distance influence on the shape
     let dist_strength = 0.2 + params.shape_roundness * 0.8;
     let threshold = params.ocean_ratio * (1.0 + dist * dist * dist_strength);
 
-    // Base elevation using internal 0.5 boundary (same as original get_cell_elevation)
-    // This gives smooth continuous values that can be compared against water_threshold
-    let base_elevation = if noise_normalized > threshold {
-        // Land: scale to 0.5-1.0 range
-        // excess shows how far above threshold - small island = small excess = low mountains
-        let excess = (noise_normalized - threshold) / (1.0 - threshold).max(0.01);
-        // Quadratic: mountains only form deep inside landmass
-        // excess=0.2 → 0.02, excess=0.5 → 0.125, excess=1.0 → 0.5
-        0.5 + excess * excess * 0.5
+    // Is this point land or water?
+    let is_land = shape_normalized > threshold;
+
+    // === LAYER 2: Ridge noise for mountain ranges (MACRO structure) ===
+    let mut height_noise = FastNoiseLite::with_seed(params.seed as i32 + 5000);
+    height_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+    height_noise.set_frequency(Some(0.003)); // Very low frequency = large mountain ranges
+
+    // Ridged FBM: creates sharp mountain ridges
+    // Only 2 octaves = clean macro structure without noise
+    let ridge_value = ridged_fbm(&height_noise, x, z, 2, 0.5);
+
+    if is_land {
+        // Land: elevation from 0.5 to 1.0
+        // Height is determined by separate noise, NOT by distance to coast
+
+        // How far above the land threshold (for smooth coast transition)
+        let coast_margin = (shape_normalized - threshold) / (1.0 - threshold).max(0.01);
+        let coast_margin = coast_margin.clamp(0.0, 1.0);
+
+        // Smooth transition at coastline (first ~10% of coast_margin)
+        let coast_blend = (coast_margin * 10.0).min(1.0);
+
+        // MACRO terrain from ridges (full 0.5 range for strong elevation contrast)
+        let macro_height = ridge_value * 0.5;
+
+        // Micro detail noise (very subtle texture, 3-4x less than before)
+        let mut detail_noise = FastNoiseLite::with_seed(params.seed as i32 + 6000);
+        detail_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
+        detail_noise.set_frequency(Some(0.02));
+        let detail = detail_noise.get_noise_2d(x, z) * 0.03; // Only 3% variation
+
+        let elevation = 0.5 + coast_blend * (macro_height + detail);
+
+        elevation.clamp(0.5, 1.0)
     } else {
-        // Water: scale to 0.0-0.5 range
-        let deficit = (threshold - noise_normalized) / threshold.max(0.01);
-        (0.5 - deficit * 0.5).max(0.0)
-    };
+        // Water: elevation from 0.0 to 0.5
+        let deficit = (threshold - shape_normalized) / threshold.max(0.01);
+        let deficit = deficit.clamp(0.0, 1.0);
 
-    // Add terrain detail noise (amplitude grows with elevation above water)
-    let mut detail_noise = FastNoiseLite::with_seed(params.seed as i32 + 1000);
-    detail_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-    detail_noise.set_frequency(Some(0.02));
+        // Ocean floor with subtle variation
+        let floor_variation = ridge_value * 0.05;
+        let elevation = 0.5 - deficit * 0.4 - floor_variation;
 
-    let detail = detail_noise.get_noise_2d(x, z); // -1 to 1
-
-    // Detail only affects land areas, proportional to elevation
-    if base_elevation > params.water_threshold {
-        let land_height = base_elevation - params.water_threshold;
-        let detail_amplitude = land_height * 0.15;
-        (base_elevation + detail * detail_amplitude).clamp(params.water_threshold, 1.0)
-    } else {
-        // Underwater: subtle ocean floor variation
-        let floor_variation = detail * 0.02;
-        (base_elevation + floor_variation).clamp(0.0, params.water_threshold - 0.01)
+        elevation.clamp(0.0, 0.49)
     }
 }
 
@@ -463,6 +475,36 @@ fn fbm_noise(noise: &FastNoiseLite, x: f32, z: f32, octaves: u32) -> f32 {
         value += noise.get_noise_2d(x * frequency, z * frequency) * amplitude;
         max_value += amplitude;
         amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+
+    value / max_value
+}
+
+/// Ridged FBM noise - creates sharp mountain ridges
+/// Returns 0.0 to 1.0 where high values are ridge peaks
+fn ridged_fbm(noise: &FastNoiseLite, x: f32, z: f32, octaves: u32, persistence: f32) -> f32 {
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut max_value = 0.0;
+    let mut weight = 1.0;
+
+    for _ in 0..octaves {
+        // Get noise and create ridge by taking 1 - abs(noise)
+        let n = noise.get_noise_2d(x * frequency, z * frequency);
+        let ridge = 1.0 - n.abs(); // Ridge: peaks where noise crosses zero
+        let ridge_sq = ridge * ridge; // Sharpen the ridges
+
+        // Weight by previous octave to create erosion effect
+        let weighted = ridge_sq * weight;
+        value += weighted * amplitude;
+        max_value += amplitude;
+
+        // Update weight for next octave (higher ridges get more detail)
+        weight = ridge_sq.clamp(0.0, 1.0);
+
+        amplitude *= persistence;
         frequency *= 2.0;
     }
 

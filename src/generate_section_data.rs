@@ -38,9 +38,10 @@ fn elevation_to_surface_y(elevation: f32, water_threshold: f32, sea_level: u16, 
     }
 }
 
-/// Get surface block based on elevation/biome
-/// water_threshold defines the land/water boundary
-fn get_surface_block(elevation: f32, water_threshold: f32) -> BlockID {
+/// Get surface block based on slope and proximity to water
+/// slope: 0.0 = flat, higher = steeper
+/// is_beach: true if close to water level
+fn get_surface_block(elevation: f32, water_threshold: f32, slope: f32, is_beach: bool) -> BlockID {
     if elevation < water_threshold {
         // Underwater - ocean floor
         if elevation < water_threshold * 0.5 {
@@ -48,40 +49,25 @@ fn get_surface_block(elevation: f32, water_threshold: f32) -> BlockID {
         } else {
             BlockID::Sand // Shallow ocean floor
         }
+    } else if is_beach {
+        BlockID::Sand // Beach near water
+    } else if slope > 0.06 {
+        BlockID::Stone // Steep slope = exposed rock
+    } else if slope > 0.03 {
+        BlockID::Gravel // Moderate slope = rocky
     } else {
-        // Above water - land
-        let land_elevation = elevation - water_threshold;
-        if land_elevation < 0.08 {
-            BlockID::Sand // Beach (just above water line)
-        } else if land_elevation < 0.20 {
-            BlockID::Grass // Plains
-        } else if land_elevation < 0.40 {
-            BlockID::Podzol // Forest
-        } else if land_elevation < 0.55 {
-            BlockID::Stone // Hills (exposed rock)
-        } else if land_elevation < 0.70 {
-            BlockID::Gravel // Mountains
-        } else {
-            BlockID::SmoothStone // Peaks
-        }
+        BlockID::Grass // Flat = grass
     }
 }
 
-/// Get subsurface block (layer below surface)
-fn get_subsurface_block(elevation: f32, water_threshold: f32) -> BlockID {
-    if elevation < water_threshold {
-        // Underwater
-        BlockID::Sand // Ocean floor has sand below
+/// Get subsurface block based on slope
+fn get_subsurface_block(elevation: f32, water_threshold: f32, slope: f32, is_beach: bool) -> BlockID {
+    if elevation < water_threshold || is_beach {
+        BlockID::Sand // Ocean/beach has sand below
+    } else if slope > 0.03 {
+        BlockID::Stone // Rocky areas have stone below
     } else {
-        // Land
-        let land_elevation = elevation - water_threshold;
-        if land_elevation < 0.08 {
-            BlockID::Sand // Beach has sand below
-        } else if land_elevation < 0.40 {
-            BlockID::CoarseDirt // Plains/forest have dirt
-        } else {
-            BlockID::Stone // Hills/mountains have stone
-        }
+        BlockID::CoarseDirt // Flat areas have dirt
     }
 }
 
@@ -134,6 +120,20 @@ pub fn generate_section_data(
             // Interpolate elevation from corners
             let elevation = interpolate_elevation(world_point, &corners);
 
+            // Calculate slope by sampling neighbors
+            let elev_px = interpolate_elevation((world_x + 1.5, world_z + 0.5), &corners);
+            let elev_mx = interpolate_elevation((world_x - 0.5, world_z + 0.5), &corners);
+            let elev_pz = interpolate_elevation((world_x + 0.5, world_z + 1.5), &corners);
+            let elev_mz = interpolate_elevation((world_x + 0.5, world_z - 0.5), &corners);
+
+            let dx = (elev_px - elev_mx).abs();
+            let dz = (elev_pz - elev_mz).abs();
+            let slope = (dx * dx + dz * dz).sqrt();
+
+            // Beach = land close to water level
+            let is_beach = elevation >= settings.water_threshold
+                && elevation < settings.water_threshold + 0.05;
+
             // Convert elevation to Y coordinate
             let surface_y = elevation_to_surface_y(
                 elevation,
@@ -143,10 +143,8 @@ pub fn generate_section_data(
             ) as usize;
 
             // Get blocks for this column
-            // Coastline is defined by elevation isoline at water_threshold
-            let surface_block = get_surface_block(elevation, settings.water_threshold);
-            let subsurface_block = get_subsurface_block(elevation, settings.water_threshold);
-            let is_underwater = elevation < settings.water_threshold;
+            let surface_block = get_surface_block(elevation, settings.water_threshold, slope, is_beach);
+            let subsurface_block = get_subsurface_block(elevation, settings.water_threshold, slope, is_beach);
 
             for y in 0_u8..(CHUNK_SIZE as u8) {
                 let y_global = section_y_start + y as usize;

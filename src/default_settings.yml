@@ -12,7 +12,7 @@ elevation_noise_scale: 0.3
 water_threshold: 0.2
 
 # Island radius in blocks from center (0,0)
-island_radius: 80.0
+island_radius: 100.0
 
 # Ocean ratio - base noise threshold (higher = more water/smaller island)
 ocean_ratio: 0.3
