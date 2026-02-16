@@ -183,59 +183,29 @@ pub fn get_continuous_elevation(
     // Is this point land or water?
     let is_land = shape_normalized > threshold;
 
-    // === LAYER 2: Ridge noise for mountain ranges (MACRO structure) ===
-    // Frequency scaled to island size: ~2-3 ridges per island diameter
-    let ridge_frequency = 1.0 / (params.island_radius * 1.5);
-
-    let mut height_noise = FastNoiseLite::with_seed(params.seed as i32 + 5000);
-    height_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
-    height_noise.set_frequency(Some(ridge_frequency));
-
-    // Ridged FBM: creates sharp mountain ridges
-    let ridge_value = ridged_fbm(&height_noise, x, z, 3, 0.5);
-
     if is_land {
-        // Land: elevation from 0.5 to 1.0
-        // Height is determined by separate noise, NOT by distance to coast
-
-        // How far above the land threshold (for smooth coast transition)
         let coast_margin = (shape_normalized - threshold) / (1.0 - threshold).max(0.01);
         let coast_margin = coast_margin.clamp(0.0, 1.0);
 
-        // Smooth transition at coastline (avoid mountains right at water)
         let coast_blend = (coast_margin * 5.0).min(1.0);
 
-        // Base land elevation - increases as you go inland (beach → inland)
-        // This ensures flat areas inland have higher elevation than coast
-        let base_land = coast_blend * 0.1; // 0 at coast, 0.1 inland
+        let base_land = coast_blend * 0.1;
 
-        // MACRO terrain from ridges - stronger amplitude for real mountains
-        let macro_height = ridge_value * ridge_value * 0.4; // Squared for sharper peaks
-
-        // Micro detail noise (subtle texture)
         let mut detail_noise = FastNoiseLite::with_seed(params.seed as i32 + 6000);
         detail_noise.set_noise_type(Some(NoiseType::OpenSimplex2));
         detail_noise.set_frequency(Some(0.015));
         let detail = detail_noise.get_noise_2d(x, z) * 0.02;
 
-        // Elevation: 0.5 (coast) + base_land (0-0.1) + mountains
-        let elevation = 0.5 + base_land + coast_blend * (macro_height + detail);
+        let elevation = 0.5 + base_land + detail;
 
         elevation.clamp(0.5, 1.0)
     } else {
-        // Water: elevation from 0.0 to 0.5
-        // deficit = how far below threshold (0 = at coast, 1 = deep ocean)
         let deficit = (threshold - shape_normalized) / threshold.max(0.01);
         let deficit = deficit.clamp(0.0, 1.0);
 
-        // Use sqrt for faster initial drop near coastline
-        // At coast (deficit=0.01): sqrt(0.01)=0.1 -> drops 10% immediately
-        // Mid ocean (deficit=0.5): sqrt(0.5)=0.7 -> 70% depth
         let deficit_fast = deficit.sqrt();
 
-        // Ocean floor with subtle variation
-        let floor_variation = ridge_value * 0.03;
-        let elevation = 0.5 - deficit_fast * 0.4 - floor_variation;
+        let elevation = 0.5 - deficit_fast * 0.4;
 
         elevation.clamp(0.0, 0.49)
     }
@@ -507,36 +477,6 @@ fn fbm_noise(noise: &FastNoiseLite, x: f32, z: f32, octaves: u32) -> f32 {
         value += noise.get_noise_2d(x * frequency, z * frequency) * amplitude;
         max_value += amplitude;
         amplitude *= 0.5;
-        frequency *= 2.0;
-    }
-
-    value / max_value
-}
-
-/// Ridged FBM noise - creates sharp mountain ridges
-/// Returns 0.0 to 1.0 where high values are ridge peaks
-fn ridged_fbm(noise: &FastNoiseLite, x: f32, z: f32, octaves: u32, persistence: f32) -> f32 {
-    let mut value = 0.0;
-    let mut amplitude = 1.0;
-    let mut frequency = 1.0;
-    let mut max_value = 0.0;
-    let mut weight = 1.0;
-
-    for _ in 0..octaves {
-        // Get noise and create ridge by taking 1 - abs(noise)
-        let n = noise.get_noise_2d(x * frequency, z * frequency);
-        let ridge = 1.0 - n.abs(); // Ridge: peaks where noise crosses zero
-        let ridge_sq = ridge * ridge; // Sharpen the ridges
-
-        // Weight by previous octave to create erosion effect
-        let weighted = ridge_sq * weight;
-        value += weighted * amplitude;
-        max_value += amplitude;
-
-        // Update weight for next octave (higher ridges get more detail)
-        weight = ridge_sq.clamp(0.0, 1.0);
-
-        amplitude *= persistence;
         frequency *= 2.0;
     }
 
