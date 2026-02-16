@@ -7,6 +7,7 @@ use crate::settings::GeneratorSettings;
 pub struct MacroData {}
 
 pub fn generate_section_data(
+    _seed: u64,
     _chunk_position: &ChunkPosition,
     _vertical_index: usize,
     _macro_data: &MacroData,

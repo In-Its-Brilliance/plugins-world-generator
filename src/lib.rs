@@ -47,9 +47,10 @@ pub fn on_chunk_generate(event: ChunkGenerateEvent) -> Result<ChunkData, Error> 
     )
     .map_err(|e| Error::msg(format!("MacroData parse error: {}", e)))?;
 
+    let seed = event.get_world_settings().get_seed();
     let mut chunk_data = ChunkData::default();
     for y in 0..VERTICAL_SECTIONS {
-        let chunk_section = generate_section_data(&chunk_position, y, &macro_data, &settings);
+        let chunk_section = generate_section_data(seed, &chunk_position, y, &macro_data, &settings);
         chunk_data.push_section(chunk_section);
     }
 
