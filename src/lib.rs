@@ -8,8 +8,8 @@ use common::{
     VERTICAL_SECTIONS,
 };
 use extism_pdk::Error;
-use generate_section_data::{generate_section_data, MacroData};
-use generate_world_macro::{generate_world_macro};
+use generate_section_data::generate_section_data;
+use generate_world_macro::{generate_world_macro, MacroData};
 use settings::GeneratorSettings;
 
 mod generate_section_data;
