@@ -20,6 +20,20 @@ use crate::settings::GeneratorSettings;
 /// Все производные параметры рассчитываются из этого значения.
 const ISLAND_SIZE: f64 = 600.0;
 
+// ─── Параметры береговой линии ──────────────────────────────────────────────
+
+/// Сила влияния noise на береговую линию.
+/// Чем больше, тем дальше берег может отступать от горного контура
+/// и тем глубже заливы могут врезаться в сушу.
+/// При 0 берег строго следует за контуром гор.
+const COAST_SPREAD: f64 = 0.8;
+
+/// Извилистость береговой линии (базовая частота noise).
+/// Маленькое значение = крупные полуострова и заливы.
+/// Большое значение = мелкие мысы и бухты, фрактальный край.
+/// Рекомендуемый диапазон: 0.003 (крупные формы) .. 0.02 (фрактальный).
+const COAST_FRACTAL: f64 = 0.006;
+
 // ─── Постоянные параметры (не зависят от размера) ───────────────────────────
 
 /// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
@@ -72,7 +86,7 @@ struct IslandParams {
     spine_length: f64,
     /// Длина рукава (в блоках)
     arm_length: f64,
-    /// Максимальное расстояние от хребта, в пределах которого есть суша
+    /// Базовое расстояние от хребта, в пределах которого суша (без noise)
     land_width: f64,
     /// Расстояние от хребта для высокогорья
     highland_width: f64,
@@ -329,6 +343,138 @@ fn generate_ridge(
     points
 }
 
+// ─── Когерентный noise для береговой линии ──────────────────────────────────
+
+/// Детерминированный hash для узла сетки noise.
+/// Возвращает значение в диапазоне -1..1.
+fn hash_2d(ix: i64, iz: i64, seed: u64) -> f64 {
+    let mut h = seed;
+    h = h.wrapping_add((ix as u64).wrapping_mul(6364136223846793005));
+    h = h.wrapping_add((iz as u64).wrapping_mul(1442695040888963407));
+    h = h.wrapping_mul(h.wrapping_shr(16).wrapping_add(1376312589));
+    h = h ^ h.wrapping_shr(13);
+    h = h.wrapping_mul(h.wrapping_shr(16).wrapping_add(0x45d9f3b));
+    (h & 0x7FFFFFFF) as f64 / 0x7FFFFFFF as f64 * 2.0 - 1.0
+}
+
+/// Value noise с билинейной интерполяцией и smoothstep.
+/// Соседние точки получают близкие значения -- когерентность.
+fn coherent_noise_2d(x: f64, z: f64, seed: u64) -> f64 {
+    let ix = x.floor() as i64;
+    let iz = z.floor() as i64;
+    let fx = x - x.floor();
+    let fz = z - z.floor();
+
+    // Smoothstep для плавных переходов
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sz = fz * fz * (3.0 - 2.0 * fz);
+
+    // 4 угла ячейки
+    let n00 = hash_2d(ix, iz, seed);
+    let n10 = hash_2d(ix + 1, iz, seed);
+    let n01 = hash_2d(ix, iz + 1, seed);
+    let n11 = hash_2d(ix + 1, iz + 1, seed);
+
+    // Билинейная интерполяция
+    let nx0 = n00 + sx * (n10 - n00);
+    let nx1 = n01 + sx * (n11 - n01);
+    nx0 + sz * (nx1 - nx0)
+}
+
+/// FBM noise -- несколько октав когерентного noise.
+/// Больше октав = более детальный/фрактальный результат.
+/// persistence = 0.65 -- мелкие октавы заметно влияют на форму.
+fn fbm_noise(x: f64, z: f64, seed: u64, octaves: usize) -> f64 {
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut max_amp = 0.0;
+
+    for i in 0..octaves {
+        value += coherent_noise_2d(
+            x * frequency,
+            z * frequency,
+            seed.wrapping_add(i as u64 * 31),
+        ) * amplitude;
+        max_amp += amplitude;
+        amplitude *= 0.65;
+        frequency *= 2.0;
+    }
+
+    value / max_amp
+}
+
+/// Вычисляет "островное поле" для точки.
+///
+/// Два независимых компонента складываются:
+///   ridge_field : плавный спад от хребта (1 у хребта, 0 на краю land_width)
+///   noise_field : FBM noise в мировых координатах, не привязан к хребту
+///
+/// field = ridge_field + noise_field * COAST_SPREAD
+///
+/// field > 0 : суша
+/// field < 0 : океан
+///
+/// Noise создаёт полуострова и заливы НЕЗАВИСИМО от формы хребта,
+/// потому что сэмплируется в мировых координатах (x, z),
+/// а не в "расстоянии до хребта".
+fn island_field(
+    x: f64, z: f64,
+    raw_dist: f64,
+    land_width: f64,
+    seed: u64,
+) -> f64 {
+    // Компонент хребта: 1 у хребта, плавно спадает до 0 на land_width
+    let ridge_field = ((land_width - raw_dist) / land_width).clamp(0.0, 1.0);
+
+    // Компонент noise: независимое 2D поле в мировых координатах
+    let noise_field = fbm_noise(
+        x * COAST_FRACTAL,
+        z * COAST_FRACTAL,
+        seed.wrapping_add(7777),
+        6,
+    );
+
+    ridge_field + noise_field * COAST_SPREAD
+}
+
+/// Определяет зону для Voronoi-ячейки через островное поле.
+/// Внутренние зоны (Mountain/Highland) по raw_dist (не деформируются).
+/// Внешние зоны (Lowland/Beach/Ocean) по island_field.
+fn classify_cell(
+    cell_x: f64, cell_z: f64,
+    raw_dist: f64,
+    params: &IslandParams,
+    seed: u64,
+) -> CellZone {
+    // Внутренние зоны не деформируются noise-ом
+    if raw_dist <= MOUNTAIN_WIDTH {
+        return CellZone::Mountain;
+    }
+    if raw_dist <= params.highland_width {
+        return CellZone::Highland;
+    }
+
+    // Островное поле для внешних зон
+    let field = island_field(
+        cell_x, cell_z,
+        raw_dist,
+        params.land_width,
+        seed,
+    );
+
+    // Нормализуем beach_width в единицы поля
+    let beach_threshold = params.beach_width / params.land_width;
+
+    if field < 0.0 {
+        CellZone::Ocean
+    } else if field < beach_threshold {
+        CellZone::Beach
+    } else {
+        CellZone::Lowland
+    }
+}
+
 pub fn generate_section_data(
     seed: u64,
     chunk_position: &ChunkPosition,
@@ -353,7 +499,10 @@ pub fn generate_section_data(
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    let extent = params.spine_length + params.arm_length + params.land_width;
+    // Extent увеличен: noise может создать сушу за пределами land_width
+    let max_noise_reach = COAST_SPREAD * params.land_width;
+    let extent = params.spine_length + params.arm_length
+        + params.land_width + max_noise_reach;
     let points = generate_voronoi_points(
         seed, -extent, -extent, extent, extent,
     );
@@ -362,20 +511,12 @@ pub fn generate_section_data(
         return section_data;
     }
 
-    // Зона для каждой Voronoi-точки (для выбора текстуры)
+    // Зона для каждой Voronoi-точки через островное поле.
+    // Noise в мировых координатах создаёт полуострова и заливы
+    // независимо от формы хребта.
     let cell_zones: Vec<CellZone> = points.iter().map(|p| {
         let (dist, _) = skeleton.query_elevation(p.x, p.y);
-        if dist > params.land_width {
-            CellZone::Ocean
-        } else if dist > params.land_width - params.beach_width {
-            CellZone::Beach
-        } else if dist > params.highland_width {
-            CellZone::Lowland
-        } else if dist > MOUNTAIN_WIDTH {
-            CellZone::Highland
-        } else {
-            CellZone::Mountain
-        }
+        classify_cell(p.x, p.y, dist, &params, seed)
     }).collect();
 
     for x in 0..(CHUNK_SIZE as u8) {
