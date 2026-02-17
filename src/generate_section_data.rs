@@ -14,6 +14,14 @@ use rand::{Rng, SeedableRng};
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
 
+// ─── Единственный параметр размера ──────────────────────────────────────────
+
+/// Общий размер острова (радиус от центра до дальнего берега, в блоках).
+/// Все производные параметры рассчитываются из этого значения.
+const ISLAND_SIZE: f64 = 600.0;
+
+// ─── Постоянные параметры (не зависят от размера) ───────────────────────────
+
 /// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
 const VORONOI_CELL_SIZE: f64 = 13.0;
 
@@ -23,35 +31,8 @@ const BORDER_THICKNESS: f64 = 0.45;
 /// Высота границы над поверхностью ячейки (в блоках)
 const BORDER_HEIGHT: i32 = 1;
 
-/// Длина главного хребта от центра в каждую сторону
-const SPINE_LENGTH: f64 = 300.0;
-
-/// Количество сегментов в главном хребте
-const SPINE_SEGMENTS: usize = 12;
-
-/// Степень извилистости хребта (макс. отклонение на сегмент)
-const SPINE_WOBBLE: f64 = 40.0;
-
-/// Количество рукавов от главного хребта
-const ARM_COUNT: usize = 6;
-
-/// Длина рукава (в блоках)
-const ARM_LENGTH: f64 = 180.0;
-
-/// Сегментов в рукаве
-const ARM_SEGMENTS: usize = 8;
-
-/// Извилистость рукавов
-const ARM_WOBBLE: f64 = 30.0;
-
-/// Максимальное расстояние от хребта, в пределах которого есть суша
-const LAND_WIDTH: f64 = 120.0;
-
 /// Расстояние от хребта для пика горной гряды (ширина ~1 ячейки)
 const MOUNTAIN_WIDTH: f64 = 7.0;
-
-/// Расстояние от хребта для высокогорья
-const HIGHLAND_WIDTH: f64 = 50.0;
 
 /// Максимальная высота горной гряды над sea_level
 const MAX_PEAK_HEIGHT: i32 = 48;
@@ -67,6 +48,54 @@ const MAX_UP_CHANCE: f64 = 0.4;
 
 /// Скорость спада высоты от хребта (exp falloff)
 const RIDGE_FALLOFF: f64 = 20.0;
+
+/// Количество сегментов в главном хребте
+const SPINE_SEGMENTS: usize = 12;
+
+/// Сегментов в рукаве
+const ARM_SEGMENTS: usize = 8;
+
+/// Количество рукавов от главного хребта
+const ARM_COUNT: usize = 6;
+
+/// Степень извилистости хребта (макс. отклонение на сегмент)
+const SPINE_WOBBLE: f64 = 40.0;
+
+/// Извилистость рукавов
+const ARM_WOBBLE: f64 = 30.0;
+
+// ─── Производные параметры из ISLAND_SIZE ───────────────────────────────────
+
+/// Все размеры острова, рассчитанные из единого ISLAND_SIZE
+struct IslandParams {
+    /// Длина главного хребта от центра в каждую сторону
+    spine_length: f64,
+    /// Длина рукава (в блоках)
+    arm_length: f64,
+    /// Максимальное расстояние от хребта, в пределах которого есть суша
+    land_width: f64,
+    /// Расстояние от хребта для высокогорья
+    highland_width: f64,
+    /// Ширина пляжной зоны (в блоках)
+    beach_width: f64,
+}
+
+impl IslandParams {
+    /// Создаёт все параметры пропорционально из одного размера.
+    /// ISLAND_SIZE = spine_length + arm_length + land_width
+    fn from_size(size: f64) -> Self {
+        let spine_length = size * 0.5;
+        let arm_length = size * 0.3;
+        let land_width = size * 0.2;
+        Self {
+            spine_length,
+            arm_length,
+            land_width,
+            highland_width: land_width * 0.42,
+            beach_width: 16.0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum CellZone {
@@ -147,34 +176,39 @@ struct IslandSkeleton {
 }
 
 impl IslandSkeleton {
-    fn generate(seed: u64) -> Self {
+    /// Генерирует хребет + рукава из seed.
+    /// Вероятность подъёма зависит от размера острова,
+    /// но всегда меньше вероятности спуска.
+    fn generate(seed: u64, params: &IslandParams) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut polylines = Vec::new();
 
-        let island_size = SPINE_LENGTH + ARM_LENGTH;
+        let island_size = params.spine_length + params.arm_length;
         let up_chance = (BASE_UP_CHANCE
             + (island_size / 2000.0) * (MAX_UP_CHANCE - BASE_UP_CHANCE))
             .min(MAX_UP_CHANCE);
 
         let spine_angle: f64 = rng.gen::<f64>() * std::f64::consts::PI;
 
+        // Хребет вперёд от центра
         let spine_fwd = generate_ridge(
             &mut rng,
             0.0, 0.0,
             MAX_PEAK_HEIGHT as f64,
             spine_angle,
-            SPINE_LENGTH,
+            params.spine_length,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
             up_chance,
         );
 
+        // Хребет назад от центра
         let spine_back = generate_ridge(
             &mut rng,
             0.0, 0.0,
             MAX_PEAK_HEIGHT as f64,
             spine_angle + std::f64::consts::PI,
-            SPINE_LENGTH,
+            params.spine_length,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
             up_chance,
@@ -209,7 +243,7 @@ impl IslandSkeleton {
                 ax, az,
                 ah * 0.7,
                 arm_angle,
-                ARM_LENGTH,
+                params.arm_length,
                 ARM_SEGMENTS,
                 ARM_WOBBLE,
                 up_chance,
@@ -251,6 +285,8 @@ impl IslandSkeleton {
 }
 
 /// Генерирует ломаную линию хребта/рукава с высотой.
+/// Высота на каждом сегменте: с большей вероятностью спуск,
+/// с меньшей -- подъём. Последние 3 сегмента принудительно спускаются.
 fn generate_ridge(
     rng: &mut SmallRng,
     start_x: f64, start_z: f64,
@@ -281,6 +317,7 @@ fn generate_ridge(
             h -= HEIGHT_STEP;
         }
 
+        // Последние 3 сегмента принудительно спускаются к нулю
         if i >= num_segments - 3 {
             h -= HEIGHT_STEP;
         }
@@ -310,12 +347,13 @@ pub fn generate_section_data(
         return section_data;
     }
 
-    let skeleton = IslandSkeleton::generate(seed);
+    let params = IslandParams::from_size(ISLAND_SIZE);
+    let skeleton = IslandSkeleton::generate(seed, &params);
 
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    let extent = SPINE_LENGTH + ARM_LENGTH + LAND_WIDTH;
+    let extent = params.spine_length + params.arm_length + params.land_width;
     let points = generate_voronoi_points(
         seed, -extent, -extent, extent, extent,
     );
@@ -327,11 +365,11 @@ pub fn generate_section_data(
     // Зона для каждой Voronoi-точки (для выбора текстуры)
     let cell_zones: Vec<CellZone> = points.iter().map(|p| {
         let (dist, _) = skeleton.query_elevation(p.x, p.y);
-        if dist > LAND_WIDTH {
+        if dist > params.land_width {
             CellZone::Ocean
-        } else if dist > LAND_WIDTH - 16.0 {
+        } else if dist > params.land_width - params.beach_width {
             CellZone::Beach
-        } else if dist > HIGHLAND_WIDTH {
+        } else if dist > params.highland_width {
             CellZone::Lowland
         } else if dist > MOUNTAIN_WIDTH {
             CellZone::Highland
