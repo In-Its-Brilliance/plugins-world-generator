@@ -7,7 +7,7 @@ use common::{
     default_blocks_ids::BlockID,
     CHUNK_SIZE,
 };
-use delaunator::{Point};
+use delaunator::Point;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -47,11 +47,26 @@ const ARM_WOBBLE: f64 = 30.0;
 /// Максимальное расстояние от хребта, в пределах которого есть суша
 const LAND_WIDTH: f64 = 120.0;
 
-/// Расстояние от хребта для горной зоны
-const MOUNTAIN_WIDTH: f64 = 20.0;
+/// Расстояние от хребта для пика горной гряды (ширина ~1 ячейки)
+const MOUNTAIN_WIDTH: f64 = 7.0;
 
 /// Расстояние от хребта для высокогорья
 const HIGHLAND_WIDTH: f64 = 50.0;
+
+/// Максимальная высота горной гряды над sea_level
+const MAX_PEAK_HEIGHT: i32 = 48;
+
+/// Шаг изменения высоты на сегмент (в блоках)
+const HEIGHT_STEP: f64 = 6.0;
+
+/// Базовая вероятность подъёма (остальное -- спуск)
+const BASE_UP_CHANCE: f64 = 0.1;
+
+/// Максимальная вероятность подъёма (для больших островов)
+const MAX_UP_CHANCE: f64 = 0.4;
+
+/// Скорость спада высоты от хребта (exp falloff)
+const RIDGE_FALLOFF: f64 = 20.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum CellZone {
@@ -62,143 +77,219 @@ enum CellZone {
     Mountain,
 }
 
-/// Отрезок горного хребта
-struct Segment {
-    x0: f64, z0: f64,
-    x1: f64, z1: f64,
+/// Точка на хребте с координатами и высотой
+#[derive(Clone, Copy)]
+struct RidgePoint {
+    x: f64,
+    z: f64,
+    h: f64,
 }
 
-impl Segment {
-    /// Минимальное расстояние от точки до отрезка
-    fn distance_to(&self, px: f64, pz: f64) -> f64 {
-        let dx = self.x1 - self.x0;
-        let dz = self.z1 - self.z0;
-        let len_sq = dx * dx + dz * dz;
+/// Цельная ломаная линия хребта/рукава
+struct Polyline {
+    points: Vec<RidgePoint>,
+}
 
-        if len_sq < 1e-10 {
-            let ex = px - self.x0;
-            let ez = pz - self.z0;
-            return (ex * ex + ez * ez).sqrt();
+impl Polyline {
+    /// Находит ближайшую точку на всей ломаной.
+    /// Возвращает (расстояние, интерполированная высота).
+    /// Проекция плавно скользит по цепочке сегментов без скачков.
+    fn nearest_point(&self, px: f64, pz: f64) -> (f64, f64) {
+        let mut best_dist = f64::MAX;
+        let mut best_h = 0.0;
+
+        for w in self.points.windows(2) {
+            let (d, h) = project_on_segment(
+                px, pz,
+                w[0].x, w[0].z, w[0].h,
+                w[1].x, w[1].z, w[1].h,
+            );
+            if d < best_dist {
+                best_dist = d;
+                best_h = h;
+            }
         }
 
-        let t = ((px - self.x0) * dx + (pz - self.z0) * dz) / len_sq;
-        let t = t.clamp(0.0, 1.0);
-
-        let cx = self.x0 + t * dx;
-        let cz = self.z0 + t * dz;
-        let ex = px - cx;
-        let ez = pz - cz;
-        (ex * ex + ez * ez).sqrt()
+        (best_dist, best_h)
     }
 }
 
+/// Проекция точки на отрезок с интерполяцией высоты.
+/// Возвращает (расстояние до отрезка, высота в точке проекции).
+fn project_on_segment(
+    px: f64, pz: f64,
+    x0: f64, z0: f64, h0: f64,
+    x1: f64, z1: f64, h1: f64,
+) -> (f64, f64) {
+    let dx = x1 - x0;
+    let dz = z1 - z0;
+    let len_sq = dx * dx + dz * dz;
+
+    if len_sq < 1e-10 {
+        let ex = px - x0;
+        let ez = pz - z0;
+        return ((ex * ex + ez * ez).sqrt(), h0);
+    }
+
+    let t = ((px - x0) * dx + (pz - z0) * dz) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+
+    let cx = x0 + t * dx;
+    let cz = z0 + t * dz;
+    let ex = px - cx;
+    let ez = pz - cz;
+
+    ((ex * ex + ez * ez).sqrt(), h0 + t * (h1 - h0))
+}
+
 struct IslandSkeleton {
-    segments: Vec<Segment>,
+    polylines: Vec<Polyline>,
 }
 
 impl IslandSkeleton {
-    /// Генерирует хребет + рукава из seed
     fn generate(seed: u64) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
-        let mut segments = Vec::new();
+        let mut polylines = Vec::new();
 
-        // Главный хребет: ломаная через (0,0)
+        let island_size = SPINE_LENGTH + ARM_LENGTH;
+        let up_chance = (BASE_UP_CHANCE
+            + (island_size / 2000.0) * (MAX_UP_CHANCE - BASE_UP_CHANCE))
+            .min(MAX_UP_CHANCE);
+
         let spine_angle: f64 = rng.gen::<f64>() * std::f64::consts::PI;
-        let spine_points = generate_ridge(
+
+        let spine_fwd = generate_ridge(
             &mut rng,
             0.0, 0.0,
+            MAX_PEAK_HEIGHT as f64,
             spine_angle,
             SPINE_LENGTH,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
+            up_chance,
         );
 
-        // Хребет идёт в обе стороны от центра
-        let spine_points_back = generate_ridge(
+        let spine_back = generate_ridge(
             &mut rng,
             0.0, 0.0,
+            MAX_PEAK_HEIGHT as f64,
             spine_angle + std::f64::consts::PI,
             SPINE_LENGTH,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
+            up_chance,
         );
 
-        add_segments(&spine_points, &mut segments);
-        add_segments(&spine_points_back, &mut segments);
+        // Объединяем в одну polyline: back(reversed) + fwd
+        // Так центр острова -- середина polyline, без стыка
+        let mut spine_points: Vec<RidgePoint> = spine_back.iter()
+            .rev()
+            .map(|&(x, z, h)| RidgePoint { x, z, h })
+            .collect();
+        // Пропускаем первую точку fwd (она == последняя back, т.е. (0,0))
+        for &(x, z, h) in spine_fwd.iter().skip(1) {
+            spine_points.push(RidgePoint { x, z, h });
+        }
 
-        // Все точки хребта для ответвлений
-        let mut all_spine: Vec<(f64, f64)> = Vec::new();
-        all_spine.extend_from_slice(&spine_points);
-        all_spine.extend_from_slice(&spine_points_back);
+        // Собираем все точки хребта для ответвлений рукавов
+        let all_spine: Vec<(f64, f64, f64)> = spine_points.iter()
+            .map(|p| (p.x, p.z, p.h))
+            .collect();
 
-        // Рукава от случайных точек хребта
+        polylines.push(Polyline { points: spine_points });
+
+        // Рукава как отдельные polyline
         for _ in 0..ARM_COUNT {
             let idx = rng.gen_range(1..all_spine.len());
-            let (ax, az) = all_spine[idx];
+            let (ax, az, ah) = all_spine[idx];
 
             let arm_angle = rng.gen::<f64>() * std::f64::consts::TAU;
-            let arm_points = generate_ridge(
+            let arm_raw = generate_ridge(
                 &mut rng,
                 ax, az,
+                ah * 0.7,
                 arm_angle,
                 ARM_LENGTH,
                 ARM_SEGMENTS,
                 ARM_WOBBLE,
+                up_chance,
             );
-            add_segments(&arm_points, &mut segments);
+
+            let arm_points: Vec<RidgePoint> = arm_raw.iter()
+                .map(|&(x, z, h)| RidgePoint { x, z, h })
+                .collect();
+
+            polylines.push(Polyline { points: arm_points });
         }
 
-        Self { segments }
+        Self { polylines }
     }
 
-    /// Минимальное расстояние от точки до любого сегмента хребта
-    fn distance_to(&self, px: f64, pz: f64) -> f64 {
+    /// Расстояние до хребта + elevation с exp-спадом.
+    /// Для каждой polyline находит ближайшую проекцию,
+    /// потом берёт ту, что даёт максимальную effective height.
+    fn query_elevation(&self, px: f64, pz: f64) -> (f64, f64) {
         let mut min_dist = f64::MAX;
-        for seg in &self.segments {
-            let d = seg.distance_to(px, pz);
+        let mut best_elev = 0.0;
+
+        for poly in &self.polylines {
+            let (d, h) = poly.nearest_point(px, pz);
+
             if d < min_dist {
                 min_dist = d;
             }
+
+            let falloff = (-d / RIDGE_FALLOFF).exp();
+            let elev = falloff * h;
+            if elev > best_elev {
+                best_elev = elev;
+            }
         }
-        min_dist
+
+        (min_dist, best_elev)
     }
 }
 
-/// Генерирует ломаную линию хребта/рукава
+/// Генерирует ломаную линию хребта/рукава с высотой.
 fn generate_ridge(
     rng: &mut SmallRng,
     start_x: f64, start_z: f64,
+    start_height: f64,
     angle: f64,
     length: f64,
     num_segments: usize,
     wobble: f64,
-) -> Vec<(f64, f64)> {
+    up_chance: f64,
+) -> Vec<(f64, f64, f64)> {
     let mut points = Vec::with_capacity(num_segments + 1);
-    points.push((start_x, start_z));
+    points.push((start_x, start_z, start_height));
 
     let seg_length = length / num_segments as f64;
     let mut current_angle = angle;
     let mut cx = start_x;
     let mut cz = start_z;
+    let mut h = start_height;
 
-    for _ in 0..num_segments {
+    for i in 0..num_segments {
         current_angle += (rng.gen::<f64>() - 0.5) * wobble / length * std::f64::consts::TAU;
         cx += current_angle.cos() * seg_length;
         cz += current_angle.sin() * seg_length;
-        points.push((cx, cz));
+
+        if rng.gen::<f64>() < up_chance {
+            h += HEIGHT_STEP;
+        } else {
+            h -= HEIGHT_STEP;
+        }
+
+        if i >= num_segments - 3 {
+            h -= HEIGHT_STEP;
+        }
+
+        h = h.clamp(0.0, MAX_PEAK_HEIGHT as f64);
+        points.push((cx, cz, h));
     }
 
     points
-}
-
-/// Превращает набор точек в отрезки
-fn add_segments(points: &[(f64, f64)], segments: &mut Vec<Segment>) {
-    for w in points.windows(2) {
-        segments.push(Segment {
-            x0: w[0].0, z0: w[0].1,
-            x1: w[1].0, z1: w[1].1,
-        });
-    }
 }
 
 pub fn generate_section_data(
@@ -212,7 +303,7 @@ pub fn generate_section_data(
     let section_y_offset = vertical_index as i32 * CHUNK_SIZE as i32;
     let base_y = settings.sea_level as i32;
 
-    if section_y_offset > base_y + BORDER_HEIGHT + 2 {
+    if section_y_offset > base_y + MAX_PEAK_HEIGHT + BORDER_HEIGHT + 2 {
         return section_data;
     }
     if section_y_offset + CHUNK_SIZE as i32 <= base_y - 1 {
@@ -224,7 +315,6 @@ pub fn generate_section_data(
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    // Voronoi-точки для всего острова
     let extent = SPINE_LENGTH + ARM_LENGTH + LAND_WIDTH;
     let points = generate_voronoi_points(
         seed, -extent, -extent, extent, extent,
@@ -234,9 +324,9 @@ pub fn generate_section_data(
         return section_data;
     }
 
-    // Зоны по расстоянию от скелета
-    let zones: Vec<CellZone> = points.iter().map(|p| {
-        let dist = skeleton.distance_to(p.x, p.y);
+    // Зона для каждой Voronoi-точки (для выбора текстуры)
+    let cell_zones: Vec<CellZone> = points.iter().map(|p| {
+        let (dist, _) = skeleton.query_elevation(p.x, p.y);
         if dist > LAND_WIDTH {
             CellZone::Ocean
         } else if dist > LAND_WIDTH - 16.0 {
@@ -260,7 +350,7 @@ pub fn generate_section_data(
             let dist_to_border = (second - nearest) * 0.5;
             let is_border = dist_to_border < BORDER_THICKNESS;
 
-            let zone = zones[nearest_idx];
+            let zone = cell_zones[nearest_idx];
 
             if zone == CellZone::Ocean {
                 for y in 0..(CHUNK_SIZE as u8) {
@@ -276,10 +366,13 @@ pub fn generate_section_data(
                 continue;
             }
 
+            let (_, elevation_f) = skeleton.query_elevation(wx, wz);
+            let elevation = elevation_f as i32;
+
             let top_y = if is_border {
-                base_y + BORDER_HEIGHT
+                base_y + elevation + BORDER_HEIGHT
             } else {
-                base_y
+                base_y + elevation
             };
 
             for y in 0..(CHUNK_SIZE as u8) {
@@ -315,7 +408,7 @@ fn surface_block(zone: CellZone) -> u16 {
         CellZone::Beach => BlockID::Sand.id(),
         CellZone::Lowland => BlockID::Grass.id(),
         CellZone::Highland => BlockID::Podzol.id(),
-        CellZone::Mountain => BlockID::Stone.id(),
+        CellZone::Mountain => BlockID::IronBlock.id(),
     }
 }
 
