@@ -72,6 +72,9 @@ const SPINE_WOBBLE: f64 = 40.0;
 /// Извилистость рукавов
 const ARM_WOBBLE: f64 = 30.0;
 
+/// Ширина пляжной полосы от линии воды вглубь суши (в блоках).
+const BEACH_WIDTH: f64 = 12.0;
+
 // --- Производные параметры из ISLAND_SIZE ------------------------------------
 
 struct IslandParams {
@@ -79,8 +82,10 @@ struct IslandParams {
     arm_length: f64,
     land_width: f64,
     highland_width: f64,
-    beach_width: f64,
     max_height: f64,
+    /// Порог field-значения для пляжной зоны.
+    /// Рассчитывается из BEACH_WIDTH и land_width.
+    beach_field_threshold: f64,
 }
 
 impl IslandParams {
@@ -94,8 +99,8 @@ impl IslandParams {
             arm_length,
             land_width,
             highland_width: land_width * 0.42,
-            beach_width: (size * 0.02).max(4.0).min(16.0),
             max_height,
+            beach_field_threshold: BEACH_WIDTH / land_width,
         }
     }
 }
@@ -387,37 +392,6 @@ fn island_field(
     ridge_field + noise_field * COAST_SPREAD
 }
 
-fn classify_cell(
-    cell_x: f64, cell_z: f64,
-    raw_dist: f64,
-    params: &IslandParams,
-    seed: u64,
-) -> CellZone {
-    if raw_dist <= MOUNTAIN_WIDTH {
-        return CellZone::Mountain;
-    }
-    if raw_dist <= params.highland_width {
-        return CellZone::Highland;
-    }
-
-    let field = island_field(
-        cell_x, cell_z,
-        raw_dist,
-        params.land_width,
-        seed,
-    );
-
-    let beach_threshold = params.beach_width / params.land_width;
-
-    if field < 0.0 {
-        CellZone::Ocean
-    } else if field < beach_threshold {
-        CellZone::Beach
-    } else {
-        CellZone::Lowland
-    }
-}
-
 /// Единая высота для любой точки мира.
 /// Положительная = суша над sea_level, отрицательная = дно ниже sea_level.
 /// Плавно переходит через 0 на береговой линии.
@@ -431,12 +405,37 @@ fn compute_elevation(
     let field = island_field(wx, wz, raw_dist, params.land_width, seed);
 
     if field > 0.0 {
-        // Суша: чем ближе к берегу (field->0), тем ниже
         let shore_factor = field.min(1.0);
         ridge_elev * shore_factor
     } else {
-        // Океан: плавный спуск дна
         field * MAX_OCEAN_DEPTH
+    }
+}
+
+/// Определение зоны per-pixel по непрерывному field-значению.
+/// field > 0 = суша, field <= 0 = океан.
+/// Пляж -- узкая полоса суши у берега (0 < field < BEACH_FIELD_THRESHOLD).
+fn classify_by_field(
+    wx: f64, wz: f64,
+    field: f64,
+    skeleton: &IslandSkeleton,
+    params: &IslandParams,
+) -> CellZone {
+    if field <= 0.0 {
+        return CellZone::Ocean;
+    }
+
+    if field < params.beach_field_threshold {
+        return CellZone::Beach;
+    }
+
+    let (raw_dist, _) = skeleton.query_elevation(wx, wz, params);
+    if raw_dist <= MOUNTAIN_WIDTH {
+        CellZone::Mountain
+    } else if raw_dist <= params.highland_width {
+        CellZone::Highland
+    } else {
+        CellZone::Lowland
     }
 }
 
@@ -476,27 +475,34 @@ pub fn generate_section_data(
         return section_data;
     }
 
-    let cell_zones: Vec<CellZone> = points.iter().map(|p| {
-        let (dist, _) = skeleton.query_elevation(p.x, p.y, &params);
-        classify_cell(p.x, p.y, dist, &params, seed)
-    }).collect();
-
     for x in 0..(CHUNK_SIZE as u8) {
         for z in 0..(CHUNK_SIZE as u8) {
             let wx = chunk_wx + x as f64;
             let wz = chunk_wz + z as f64;
 
-            let (nearest, second, nearest_idx) =
+            let (nearest, second, _nearest_idx) =
                 find_two_nearest_with_index(&points, wx, wz);
             let dist_to_border = (second - nearest) * 0.5;
-            let is_border = dist_to_border < BORDER_THICKNESS;
 
-            let zone = cell_zones[nearest_idx];
+            // Per-pixel elevation -- плавная береговая линия
+            let (raw_dist, _ridge_elev) = skeleton.query_elevation(wx, wz, &params);
+            let field = island_field(wx, wz, raw_dist, params.land_width, seed);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
             let elevation = elevation_f as i32;
-            let is_underwater = elevation < 0;
+            let is_underwater = elevation_f < 0.0;
 
-            let top_y = if is_border && !is_underwater {
+            // Per-pixel зона по field (не по Voronoi-ячейке)
+            let zone = classify_by_field(
+                wx, wz, field, &skeleton, &params,
+            );
+
+            // Бордюры только на суше, не на пляже и не в океане
+            let is_border = dist_to_border < BORDER_THICKNESS
+                && !is_underwater
+                && zone != CellZone::Beach
+                && zone != CellZone::Ocean;
+
+            let top_y = if is_border {
                 base_y + elevation + BORDER_HEIGHT
             } else {
                 base_y + elevation
