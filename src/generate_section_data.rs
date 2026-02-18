@@ -75,6 +75,15 @@ const ARM_WOBBLE: f64 = 30.0;
 /// Ширина пляжной полосы от линии воды вглубь суши (в блоках).
 const BEACH_WIDTH: f64 = 12.0;
 
+/// Максимальное значение shore modifier на суше (в блоках).
+const SHORE_MOD_UP: f64 = 6.0;
+
+/// Максимальное значение shore modifier под водой (в блоках).
+const SHORE_MOD_DOWN: f64 = 3.0;
+
+/// Расстояние (в блоках) на котором modifier достигает максимума.
+const SHORE_MOD_RADIUS: f64 = 40.0;
+
 // --- Производные параметры из ISLAND_SIZE ------------------------------------
 
 struct IslandParams {
@@ -84,7 +93,6 @@ struct IslandParams {
     highland_width: f64,
     max_height: f64,
     /// Порог field-значения для пляжной зоны.
-    /// Рассчитывается из BEACH_WIDTH и land_width.
     beach_field_threshold: f64,
 }
 
@@ -392,9 +400,16 @@ fn island_field(
     ridge_field + noise_field * COAST_SPREAD
 }
 
+/// Оценка горизонтального расстояния до береговой линии (field=0) в блоках.
+///
+/// Использует средний градиент field (~ 1/land_width per block).
+/// Результат со знаком: положительный на суше, отрицательный в океане.
+/// Гладкий, без шума от noise.
+fn distance_to_shore(field: f64, land_width: f64) -> f64 {
+    field * land_width
+}
+
 /// Единая высота для любой точки мира.
-/// Положительная = суша над sea_level, отрицательная = дно ниже sea_level.
-/// Плавно переходит через 0 на береговой линии.
 fn compute_elevation(
     wx: f64, wz: f64,
     skeleton: &IslandSkeleton,
@@ -404,17 +419,27 @@ fn compute_elevation(
     let (raw_dist, ridge_elev) = skeleton.query_elevation(wx, wz, params);
     let field = island_field(wx, wz, raw_dist, params.land_width, seed);
 
-    if field > 0.0 {
+    let base = if field > 0.0 {
         let shore_factor = field.min(1.0);
         ridge_elev * shore_factor
     } else {
         field * MAX_OCEAN_DEPTH
-    }
+    };
+
+    // Shore modifier: плавный подъём от берега
+    let shore_dist = distance_to_shore(field, params.land_width);
+    let abs_dist = shore_dist.abs().min(SHORE_MOD_RADIUS);
+    let t = abs_dist / SHORE_MOD_RADIUS;
+    let ease = t * (2.0 - t);
+    let modifier = if shore_dist > 0.0 {
+        ease * SHORE_MOD_UP
+    } else {
+        -ease * SHORE_MOD_DOWN
+    };
+
+    base + modifier
 }
 
-/// Определение зоны per-pixel по непрерывному field-значению.
-/// field > 0 = суша, field <= 0 = океан.
-/// Пляж -- узкая полоса суши у берега (0 < field < BEACH_FIELD_THRESHOLD).
 fn classify_by_field(
     wx: f64, wz: f64,
     field: f64,
@@ -450,8 +475,8 @@ pub fn generate_section_data(
     let section_y_offset = vertical_index as i32 * CHUNK_SIZE as i32;
     let base_y = settings.sea_level as i32;
 
-    let max_depth = MAX_OCEAN_DEPTH as i32;
-    if section_y_offset > base_y + MAX_PEAK_HEIGHT + BORDER_HEIGHT + 2 {
+    let max_depth = MAX_OCEAN_DEPTH as i32 + SHORE_MOD_DOWN as i32;
+    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + BORDER_HEIGHT + 2 {
         return section_data;
     }
     if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - 4 {
@@ -484,19 +509,16 @@ pub fn generate_section_data(
                 find_two_nearest_with_index(&points, wx, wz);
             let dist_to_border = (second - nearest) * 0.5;
 
-            // Per-pixel elevation -- плавная береговая линия
             let (raw_dist, _ridge_elev) = skeleton.query_elevation(wx, wz, &params);
             let field = island_field(wx, wz, raw_dist, params.land_width, seed);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
             let elevation = elevation_f as i32;
-            let is_underwater = elevation_f < 0.0;
+            let is_underwater = field <= 0.0;
 
-            // Per-pixel зона по field (не по Voronoi-ячейке)
             let zone = classify_by_field(
                 wx, wz, field, &skeleton, &params,
             );
 
-            // Бордюры только на суше, не на пляже и не в океане
             let is_border = dist_to_border < BORDER_THICKNESS
                 && !is_underwater
                 && zone != CellZone::Beach
