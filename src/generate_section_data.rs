@@ -14,27 +14,21 @@ use rand::{Rng, SeedableRng};
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
 
-// ─── Единственный параметр размера ──────────────────────────────────────────
+// --- Единственный параметр размера -------------------------------------------
 
 /// Общий размер острова (радиус от центра до дальнего берега, в блоках).
 /// Все производные параметры рассчитываются из этого значения.
-const ISLAND_SIZE: f64 = 600.0;
+const ISLAND_SIZE: f64 = 400.0;
 
-// ─── Параметры береговой линии ──────────────────────────────────────────────
+// --- Параметры береговой линии -----------------------------------------------
 
 /// Сила влияния noise на береговую линию.
-/// Чем больше, тем дальше берег может отступать от горного контура
-/// и тем глубже заливы могут врезаться в сушу.
-/// При 0 берег строго следует за контуром гор.
 const COAST_SPREAD: f64 = 0.8;
 
 /// Извилистость береговой линии (базовая частота noise).
-/// Маленькое значение = крупные полуострова и заливы.
-/// Большое значение = мелкие мысы и бухты, фрактальный край.
-/// Рекомендуемый диапазон: 0.003 (крупные формы) .. 0.02 (фрактальный).
 const COAST_FRACTAL: f64 = 0.006;
 
-// ─── Постоянные параметры (не зависят от размера) ───────────────────────────
+// --- Постоянные параметры (не зависят от размера) ----------------------------
 
 /// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
 const VORONOI_CELL_SIZE: f64 = 13.0;
@@ -49,19 +43,19 @@ const BORDER_HEIGHT: i32 = 1;
 const MOUNTAIN_WIDTH: f64 = 7.0;
 
 /// Максимальная высота горной гряды над sea_level
-const MAX_PEAK_HEIGHT: i32 = 48;
+const MAX_PEAK_HEIGHT: i32 = 80;
+
+/// Максимальная глубина океанского дна ниже sea_level
+const MAX_OCEAN_DEPTH: f64 = 20.0;
 
 /// Шаг изменения высоты на сегмент (в блоках)
 const HEIGHT_STEP: f64 = 6.0;
 
 /// Базовая вероятность подъёма (остальное -- спуск)
-const BASE_UP_CHANCE: f64 = 0.1;
+const BASE_UP_CHANCE: f64 = 0.35;
 
 /// Максимальная вероятность подъёма (для больших островов)
 const MAX_UP_CHANCE: f64 = 0.4;
-
-/// Скорость спада высоты от хребта (exp falloff)
-const RIDGE_FALLOFF: f64 = 20.0;
 
 /// Количество сегментов в главном хребте
 const SPINE_SEGMENTS: usize = 12;
@@ -78,35 +72,30 @@ const SPINE_WOBBLE: f64 = 40.0;
 /// Извилистость рукавов
 const ARM_WOBBLE: f64 = 30.0;
 
-// ─── Производные параметры из ISLAND_SIZE ───────────────────────────────────
+// --- Производные параметры из ISLAND_SIZE ------------------------------------
 
-/// Все размеры острова, рассчитанные из единого ISLAND_SIZE
 struct IslandParams {
-    /// Длина главного хребта от центра в каждую сторону
     spine_length: f64,
-    /// Длина рукава (в блоках)
     arm_length: f64,
-    /// Базовое расстояние от хребта, в пределах которого суша (без noise)
     land_width: f64,
-    /// Расстояние от хребта для высокогорья
     highland_width: f64,
-    /// Ширина пляжной зоны (в блоках)
     beach_width: f64,
+    max_height: f64,
 }
 
 impl IslandParams {
-    /// Создаёт все параметры пропорционально из одного размера.
-    /// ISLAND_SIZE = spine_length + arm_length + land_width
     fn from_size(size: f64) -> Self {
         let spine_length = size * 0.5;
         let arm_length = size * 0.3;
-        let land_width = size * 0.2;
+        let land_width = size * 0.4;
+        let max_height = (land_width * 0.8).min(MAX_PEAK_HEIGHT as f64);
         Self {
             spine_length,
             arm_length,
             land_width,
             highland_width: land_width * 0.42,
-            beach_width: 16.0,
+            beach_width: (size * 0.02).max(4.0).min(16.0),
+            max_height,
         }
     }
 }
@@ -120,7 +109,6 @@ enum CellZone {
     Mountain,
 }
 
-/// Точка на хребте с координатами и высотой
 #[derive(Clone, Copy)]
 struct RidgePoint {
     x: f64,
@@ -128,15 +116,11 @@ struct RidgePoint {
     h: f64,
 }
 
-/// Цельная ломаная линия хребта/рукава
 struct Polyline {
     points: Vec<RidgePoint>,
 }
 
 impl Polyline {
-    /// Находит ближайшую точку на всей ломаной.
-    /// Возвращает (расстояние, интерполированная высота).
-    /// Проекция плавно скользит по цепочке сегментов без скачков.
     fn nearest_point(&self, px: f64, pz: f64) -> (f64, f64) {
         let mut best_dist = f64::MAX;
         let mut best_h = 0.0;
@@ -157,8 +141,6 @@ impl Polyline {
     }
 }
 
-/// Проекция точки на отрезок с интерполяцией высоты.
-/// Возвращает (расстояние до отрезка, высота в точке проекции).
 fn project_on_segment(
     px: f64, pz: f64,
     x0: f64, z0: f64, h0: f64,
@@ -190,9 +172,6 @@ struct IslandSkeleton {
 }
 
 impl IslandSkeleton {
-    /// Генерирует хребет + рукава из seed.
-    /// Вероятность подъёма зависит от размера острова,
-    /// но всегда меньше вероятности спуска.
     fn generate(seed: u64, params: &IslandParams) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut polylines = Vec::new();
@@ -204,49 +183,44 @@ impl IslandSkeleton {
 
         let spine_angle: f64 = rng.gen::<f64>() * std::f64::consts::PI;
 
-        // Хребет вперёд от центра
         let spine_fwd = generate_ridge(
             &mut rng,
             0.0, 0.0,
-            MAX_PEAK_HEIGHT as f64,
+            params.max_height,
             spine_angle,
             params.spine_length,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
             up_chance,
+            params.max_height,
         );
 
-        // Хребет назад от центра
         let spine_back = generate_ridge(
             &mut rng,
             0.0, 0.0,
-            MAX_PEAK_HEIGHT as f64,
+            params.max_height,
             spine_angle + std::f64::consts::PI,
             params.spine_length,
             SPINE_SEGMENTS,
             SPINE_WOBBLE,
             up_chance,
+            params.max_height,
         );
 
-        // Объединяем в одну polyline: back(reversed) + fwd
-        // Так центр острова -- середина polyline, без стыка
         let mut spine_points: Vec<RidgePoint> = spine_back.iter()
             .rev()
             .map(|&(x, z, h)| RidgePoint { x, z, h })
             .collect();
-        // Пропускаем первую точку fwd (она == последняя back, т.е. (0,0))
         for &(x, z, h) in spine_fwd.iter().skip(1) {
             spine_points.push(RidgePoint { x, z, h });
         }
 
-        // Собираем все точки хребта для ответвлений рукавов
         let all_spine: Vec<(f64, f64, f64)> = spine_points.iter()
             .map(|p| (p.x, p.z, p.h))
             .collect();
 
         polylines.push(Polyline { points: spine_points });
 
-        // Рукава как отдельные polyline
         for _ in 0..ARM_COUNT {
             let idx = rng.gen_range(1..all_spine.len());
             let (ax, az, ah) = all_spine[idx];
@@ -261,6 +235,7 @@ impl IslandSkeleton {
                 ARM_SEGMENTS,
                 ARM_WOBBLE,
                 up_chance,
+                params.max_height,
             );
 
             let arm_points: Vec<RidgePoint> = arm_raw.iter()
@@ -273,10 +248,7 @@ impl IslandSkeleton {
         Self { polylines }
     }
 
-    /// Расстояние до хребта + elevation с exp-спадом.
-    /// Для каждой polyline находит ближайшую проекцию,
-    /// потом берёт ту, что даёт максимальную effective height.
-    fn query_elevation(&self, px: f64, pz: f64) -> (f64, f64) {
+    fn query_elevation(&self, px: f64, pz: f64, params: &IslandParams) -> (f64, f64) {
         let mut min_dist = f64::MAX;
         let mut best_elev = 0.0;
 
@@ -287,7 +259,12 @@ impl IslandSkeleton {
                 min_dist = d;
             }
 
-            let falloff = (-d / RIDGE_FALLOFF).exp();
+            let height_ratio = h / params.max_height;
+            let base = ISLAND_SIZE * 0.05;
+            let extra = height_ratio * height_ratio * ISLAND_SIZE * 0.07;
+            let dynamic_falloff = base + extra;
+
+            let falloff = (-d / dynamic_falloff).exp();
             let elev = falloff * h;
             if elev > best_elev {
                 best_elev = elev;
@@ -298,9 +275,6 @@ impl IslandSkeleton {
     }
 }
 
-/// Генерирует ломаную линию хребта/рукава с высотой.
-/// Высота на каждом сегменте: с большей вероятностью спуск,
-/// с меньшей -- подъём. Последние 3 сегмента принудительно спускаются.
 fn generate_ridge(
     rng: &mut SmallRng,
     start_x: f64, start_z: f64,
@@ -310,15 +284,17 @@ fn generate_ridge(
     num_segments: usize,
     wobble: f64,
     up_chance: f64,
+    max_height: f64,
 ) -> Vec<(f64, f64, f64)> {
     let mut points = Vec::with_capacity(num_segments + 1);
-    points.push((start_x, start_z, start_height));
+    let h0 = start_height.min(max_height);
+    points.push((start_x, start_z, h0));
 
     let seg_length = length / num_segments as f64;
     let mut current_angle = angle;
     let mut cx = start_x;
     let mut cz = start_z;
-    let mut h = start_height;
+    let mut h = h0;
 
     for i in 0..num_segments {
         current_angle += (rng.gen::<f64>() - 0.5) * wobble / length * std::f64::consts::TAU;
@@ -331,22 +307,19 @@ fn generate_ridge(
             h -= HEIGHT_STEP;
         }
 
-        // Последние 3 сегмента принудительно спускаются к нулю
         if i >= num_segments - 3 {
             h -= HEIGHT_STEP;
         }
 
-        h = h.clamp(0.0, MAX_PEAK_HEIGHT as f64);
+        h = h.clamp(0.0, max_height);
         points.push((cx, cz, h));
     }
 
     points
 }
 
-// ─── Когерентный noise для береговой линии ──────────────────────────────────
+// --- Когерентный noise для береговой линии ------------------------------------
 
-/// Детерминированный hash для узла сетки noise.
-/// Возвращает значение в диапазоне -1..1.
 fn hash_2d(ix: i64, iz: i64, seed: u64) -> f64 {
     let mut h = seed;
     h = h.wrapping_add((ix as u64).wrapping_mul(6364136223846793005));
@@ -357,33 +330,25 @@ fn hash_2d(ix: i64, iz: i64, seed: u64) -> f64 {
     (h & 0x7FFFFFFF) as f64 / 0x7FFFFFFF as f64 * 2.0 - 1.0
 }
 
-/// Value noise с билинейной интерполяцией и smoothstep.
-/// Соседние точки получают близкие значения -- когерентность.
 fn coherent_noise_2d(x: f64, z: f64, seed: u64) -> f64 {
     let ix = x.floor() as i64;
     let iz = z.floor() as i64;
     let fx = x - x.floor();
     let fz = z - z.floor();
 
-    // Smoothstep для плавных переходов
     let sx = fx * fx * (3.0 - 2.0 * fx);
     let sz = fz * fz * (3.0 - 2.0 * fz);
 
-    // 4 угла ячейки
     let n00 = hash_2d(ix, iz, seed);
     let n10 = hash_2d(ix + 1, iz, seed);
     let n01 = hash_2d(ix, iz + 1, seed);
     let n11 = hash_2d(ix + 1, iz + 1, seed);
 
-    // Билинейная интерполяция
     let nx0 = n00 + sx * (n10 - n00);
     let nx1 = n01 + sx * (n11 - n01);
     nx0 + sz * (nx1 - nx0)
 }
 
-/// FBM noise -- несколько октав когерентного noise.
-/// Больше октав = более детальный/фрактальный результат.
-/// persistence = 0.65 -- мелкие октавы заметно влияют на форму.
 fn fbm_noise(x: f64, z: f64, seed: u64, octaves: usize) -> f64 {
     let mut value = 0.0;
     let mut amplitude = 1.0;
@@ -404,30 +369,14 @@ fn fbm_noise(x: f64, z: f64, seed: u64, octaves: usize) -> f64 {
     value / max_amp
 }
 
-/// Вычисляет "островное поле" для точки.
-///
-/// Два независимых компонента складываются:
-///   ridge_field : плавный спад от хребта (1 у хребта, 0 на краю land_width)
-///   noise_field : FBM noise в мировых координатах, не привязан к хребту
-///
-/// field = ridge_field + noise_field * COAST_SPREAD
-///
-/// field > 0 : суша
-/// field < 0 : океан
-///
-/// Noise создаёт полуострова и заливы НЕЗАВИСИМО от формы хребта,
-/// потому что сэмплируется в мировых координатах (x, z),
-/// а не в "расстоянии до хребта".
 fn island_field(
     x: f64, z: f64,
     raw_dist: f64,
     land_width: f64,
     seed: u64,
 ) -> f64 {
-    // Компонент хребта: 1 у хребта, плавно спадает до 0 на land_width
     let ridge_field = ((land_width - raw_dist) / land_width).clamp(0.0, 1.0);
 
-    // Компонент noise: независимое 2D поле в мировых координатах
     let noise_field = fbm_noise(
         x * COAST_FRACTAL,
         z * COAST_FRACTAL,
@@ -438,16 +387,12 @@ fn island_field(
     ridge_field + noise_field * COAST_SPREAD
 }
 
-/// Определяет зону для Voronoi-ячейки через островное поле.
-/// Внутренние зоны (Mountain/Highland) по raw_dist (не деформируются).
-/// Внешние зоны (Lowland/Beach/Ocean) по island_field.
 fn classify_cell(
     cell_x: f64, cell_z: f64,
     raw_dist: f64,
     params: &IslandParams,
     seed: u64,
 ) -> CellZone {
-    // Внутренние зоны не деформируются noise-ом
     if raw_dist <= MOUNTAIN_WIDTH {
         return CellZone::Mountain;
     }
@@ -455,7 +400,6 @@ fn classify_cell(
         return CellZone::Highland;
     }
 
-    // Островное поле для внешних зон
     let field = island_field(
         cell_x, cell_z,
         raw_dist,
@@ -463,7 +407,6 @@ fn classify_cell(
         seed,
     );
 
-    // Нормализуем beach_width в единицы поля
     let beach_threshold = params.beach_width / params.land_width;
 
     if field < 0.0 {
@@ -472,6 +415,28 @@ fn classify_cell(
         CellZone::Beach
     } else {
         CellZone::Lowland
+    }
+}
+
+/// Единая высота для любой точки мира.
+/// Положительная = суша над sea_level, отрицательная = дно ниже sea_level.
+/// Плавно переходит через 0 на береговой линии.
+fn compute_elevation(
+    wx: f64, wz: f64,
+    skeleton: &IslandSkeleton,
+    params: &IslandParams,
+    seed: u64,
+) -> f64 {
+    let (raw_dist, ridge_elev) = skeleton.query_elevation(wx, wz, params);
+    let field = island_field(wx, wz, raw_dist, params.land_width, seed);
+
+    if field > 0.0 {
+        // Суша: чем ближе к берегу (field->0), тем ниже
+        let shore_factor = field.min(1.0);
+        ridge_elev * shore_factor
+    } else {
+        // Океан: плавный спуск дна
+        field * MAX_OCEAN_DEPTH
     }
 }
 
@@ -486,10 +451,11 @@ pub fn generate_section_data(
     let section_y_offset = vertical_index as i32 * CHUNK_SIZE as i32;
     let base_y = settings.sea_level as i32;
 
+    let max_depth = MAX_OCEAN_DEPTH as i32;
     if section_y_offset > base_y + MAX_PEAK_HEIGHT + BORDER_HEIGHT + 2 {
         return section_data;
     }
-    if section_y_offset + CHUNK_SIZE as i32 <= base_y - 1 {
+    if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - 4 {
         return section_data;
     }
 
@@ -499,7 +465,6 @@ pub fn generate_section_data(
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    // Extent увеличен: noise может создать сушу за пределами land_width
     let max_noise_reach = COAST_SPREAD * params.land_width;
     let extent = params.spine_length + params.arm_length
         + params.land_width + max_noise_reach;
@@ -511,11 +476,8 @@ pub fn generate_section_data(
         return section_data;
     }
 
-    // Зона для каждой Voronoi-точки через островное поле.
-    // Noise в мировых координатах создаёт полуострова и заливы
-    // независимо от формы хребта.
     let cell_zones: Vec<CellZone> = points.iter().map(|p| {
-        let (dist, _) = skeleton.query_elevation(p.x, p.y);
+        let (dist, _) = skeleton.query_elevation(p.x, p.y, &params);
         classify_cell(p.x, p.y, dist, &params, seed)
     }).collect();
 
@@ -530,25 +492,11 @@ pub fn generate_section_data(
             let is_border = dist_to_border < BORDER_THICKNESS;
 
             let zone = cell_zones[nearest_idx];
-
-            if zone == CellZone::Ocean {
-                for y in 0..(CHUNK_SIZE as u8) {
-                    let world_y = section_y_offset + y as i32;
-                    if world_y <= base_y {
-                        let pos = ChunkBlockPosition::new(x, y, z);
-                        section_data.insert(
-                            &pos,
-                            BlockDataInfo::create(BlockID::Water.id()),
-                        );
-                    }
-                }
-                continue;
-            }
-
-            let (_, elevation_f) = skeleton.query_elevation(wx, wz);
+            let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
             let elevation = elevation_f as i32;
+            let is_underwater = elevation < 0;
 
-            let top_y = if is_border {
+            let top_y = if is_border && !is_underwater {
                 base_y + elevation + BORDER_HEIGHT
             } else {
                 base_y + elevation
@@ -556,24 +504,53 @@ pub fn generate_section_data(
 
             for y in 0..(CHUNK_SIZE as u8) {
                 let world_y = section_y_offset + y as i32;
-                if world_y > top_y {
+
+                if world_y > top_y && world_y > base_y {
                     continue;
                 }
 
-                let block_id = if world_y == top_y {
-                    if is_border {
-                        border_block(zone)
+                let pos = ChunkBlockPosition::new(x, y, z);
+
+                if world_y > top_y && world_y <= base_y {
+                    section_data.insert(
+                        &pos,
+                        BlockDataInfo::create(BlockID::Water.id()),
+                    );
+                } else if world_y == top_y {
+                    if is_underwater {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Sand.id()),
+                        );
+                    } else if is_border {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(border_block(zone)),
+                        );
                     } else {
-                        surface_block(zone)
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(surface_block(zone)),
+                        );
                     }
                 } else if world_y >= top_y - 3 {
-                    subsurface_block(zone)
+                    if is_underwater {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Sandstone.id()),
+                        );
+                    } else {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(subsurface_block(zone)),
+                        );
+                    }
                 } else {
-                    BlockID::Stone.id()
-                };
-
-                let pos = ChunkBlockPosition::new(x, y, z);
-                section_data.insert(&pos, BlockDataInfo::create(block_id));
+                    section_data.insert(
+                        &pos,
+                        BlockDataInfo::create(BlockID::Stone.id()),
+                    );
+                }
             }
         }
     }
