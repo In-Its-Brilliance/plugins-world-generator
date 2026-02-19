@@ -37,7 +37,7 @@ const VORONOI_CELL_SIZE: f64 = 13.0;
 const BORDER_THICKNESS: f64 = 0.45;
 
 /// Высота границы над поверхностью ячейки (в блоках)
-const BORDER_HEIGHT: i32 = 1;
+const BORDER_HEIGHT: i32 = 0;
 
 /// Расстояние от хребта для пика горной гряды (ширина ~1 ячейки)
 const MOUNTAIN_WIDTH: f64 = 7.0;
@@ -83,6 +83,17 @@ const SHORE_MOD_DOWN: f64 = 3.0;
 
 /// Расстояние (в блоках) на котором modifier достигает максимума.
 const SHORE_MOD_RADIUS: f64 = 40.0;
+
+// --- Параметры микрорельефа поверхности --------------------------------------
+
+/// Максимальная амплитуда поверхностного шума (в блоках).
+const SURFACE_NOISE_AMPLITUDE: f64 = 7.0;
+
+/// Частота поверхностного шума (чем меньше, тем крупнее холмы).
+const SURFACE_NOISE_FREQUENCY: f64 = 0.008;
+
+/// Количество октав поверхностного шума.
+const SURFACE_NOISE_OCTAVES: usize = 4;
 
 // --- Производные параметры из ISLAND_SIZE ------------------------------------
 
@@ -437,7 +448,36 @@ fn compute_elevation(
         -ease * SHORE_MOD_DOWN
     };
 
-    base + modifier
+    // Поверхностный шум: непрерывный волнистый рельеф
+    let raw_noise = fbm_noise(
+        wx * 0.012,
+        wz * 0.012,
+        seed.wrapping_add(55555),
+        4,
+    );
+
+    // Плавные складки: только положительная часть noise
+    let hills = raw_noise.max(0.0) * raw_noise.max(0.0) * 30.0;
+
+    // Мелкая детализация
+    let detail_noise = fbm_noise(
+        wx * 0.025,
+        wz * 0.025,
+        seed.wrapping_add(88888),
+        2,
+    );
+    let detail = detail_noise.max(0.0) * 4.0;
+
+    // Только пляж плоский, всё остальное -- рельеф
+    let shore_fade = if field <= params.beach_field_threshold {
+        0.0
+    } else {
+        ((field - params.beach_field_threshold) * 8.0).min(1.0)
+    };
+
+    let surface_mod = (hills + detail) * shore_fade;
+
+    base + modifier + surface_mod
 }
 
 fn classify_by_field(
@@ -476,10 +516,10 @@ pub fn generate_section_data(
     let base_y = settings.sea_level as i32;
 
     let max_depth = MAX_OCEAN_DEPTH as i32 + SHORE_MOD_DOWN as i32;
-    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + BORDER_HEIGHT + 2 {
+    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + SURFACE_NOISE_AMPLITUDE as i32 + BORDER_HEIGHT + 2 {
         return section_data;
     }
-    if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - 4 {
+    if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - SURFACE_NOISE_AMPLITUDE as i32 - 4 {
         return section_data;
     }
 
