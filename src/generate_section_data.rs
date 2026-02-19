@@ -23,12 +23,17 @@ const ISLAND_SIZE: f64 = 400.0;
 // --- Параметры береговой линии -----------------------------------------------
 
 /// Сила влияния noise на береговую линию.
-const COAST_SPREAD: f64 = 0.8;
+const COAST_SPREAD: f64 = 0.7;
 
 /// Извилистость береговой линии (базовая частота noise).
 const COAST_FRACTAL: f64 = 0.006;
 
 // --- Постоянные параметры (не зависят от размера) ----------------------------
+
+/// Минимальная ширина суши вокруг горного хребта (в блоках).
+/// Гарантированная суша = MOUNTAIN_LAND_RADIUS * (1 - COAST_SPREAD).
+/// При 120 и spread 0.7: гарантия = 36 блоков.
+const MOUNTAIN_LAND_RADIUS: f64 = 120.0;
 
 /// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
 const VORONOI_CELL_SIZE: f64 = 13.0;
@@ -75,6 +80,10 @@ const ARM_WOBBLE: f64 = 30.0;
 /// Ширина пляжной полосы от линии воды вглубь суши (в блоках).
 const BEACH_WIDTH: f64 = 12.0;
 
+/// Коэффициент масштабирования высоты гор от размера острова.
+/// max_height = land_width * MOUNTAIN_SCALE * sqrt(size / 400), cap MAX_PEAK_HEIGHT.
+const MOUNTAIN_SCALE: f64 = 0.35;
+
 /// Максимальное значение shore modifier на суше (в блоках).
 const SHORE_MOD_UP: f64 = 6.0;
 
@@ -90,10 +99,17 @@ struct IslandParams {
     spine_length: f64,
     arm_length: f64,
     land_width: f64,
+    mountain_land_radius: f64,
     highland_width: f64,
     max_height: f64,
     /// Порог field-значения для пляжной зоны.
     beach_field_threshold: f64,
+    /// Максимальный подъём на суше от shore modifier (в блоках).
+    shore_mod_up: f64,
+    /// Максимальное углубление под водой от shore modifier (в блоках).
+    shore_mod_down: f64,
+    /// Расстояние (в блоках) на котором modifier достигает максимума.
+    shore_mod_radius: f64,
 }
 
 impl IslandParams {
@@ -101,14 +117,19 @@ impl IslandParams {
         let spine_length = size * 0.5;
         let arm_length = size * 0.3;
         let land_width = size * 0.4;
-        let max_height = (land_width * 0.8).min(MAX_PEAK_HEIGHT as f64);
+        let mountain_land_radius = MOUNTAIN_LAND_RADIUS;
+        let max_height = (land_width * MOUNTAIN_SCALE * (size / 400.0).sqrt()).min(MAX_PEAK_HEIGHT as f64);
         Self {
             spine_length,
             arm_length,
             land_width,
-            highland_width: land_width * 0.42,
+            mountain_land_radius,
+            highland_width: mountain_land_radius * 0.6,
             max_height,
-            beach_field_threshold: BEACH_WIDTH / land_width,
+            beach_field_threshold: BEACH_WIDTH / mountain_land_radius,
+            shore_mod_up: SHORE_MOD_UP,
+            shore_mod_down: SHORE_MOD_DOWN,
+            shore_mod_radius: SHORE_MOD_RADIUS,
         }
     }
 }
@@ -385,10 +406,11 @@ fn fbm_noise(x: f64, z: f64, seed: u64, octaves: usize) -> f64 {
 fn island_field(
     x: f64, z: f64,
     raw_dist: f64,
-    land_width: f64,
+    params: &IslandParams,
     seed: u64,
 ) -> f64 {
-    let ridge_field = ((land_width - raw_dist) / land_width).clamp(0.0, 1.0);
+    let ridge_field = ((params.mountain_land_radius - raw_dist) / params.mountain_land_radius)
+        .clamp(0.0, 1.0);
 
     let noise_field = fbm_noise(
         x * COAST_FRACTAL,
@@ -402,11 +424,10 @@ fn island_field(
 
 /// Оценка горизонтального расстояния до береговой линии (field=0) в блоках.
 ///
-/// Использует средний градиент field (~ 1/land_width per block).
+/// Использует средний градиент field (~ 1/mountain_land_radius per block).
 /// Результат со знаком: положительный на суше, отрицательный в океане.
-/// Гладкий, без шума от noise.
-fn distance_to_shore(field: f64, land_width: f64) -> f64 {
-    field * land_width
+fn distance_to_shore(field: f64, mountain_land_radius: f64) -> f64 {
+    field * mountain_land_radius
 }
 
 /// Единая высота для любой точки мира.
@@ -417,7 +438,7 @@ fn compute_elevation(
     seed: u64,
 ) -> f64 {
     let (raw_dist, ridge_elev) = skeleton.query_elevation(wx, wz, params);
-    let field = island_field(wx, wz, raw_dist, params.land_width, seed);
+    let field = island_field(wx, wz, raw_dist, params, seed);
 
     let base = if field > 0.0 {
         let shore_factor = field.min(1.0);
@@ -427,14 +448,14 @@ fn compute_elevation(
     };
 
     // Shore modifier: плавный подъём от берега
-    let shore_dist = distance_to_shore(field, params.land_width);
-    let abs_dist = shore_dist.abs().min(SHORE_MOD_RADIUS);
-    let t = abs_dist / SHORE_MOD_RADIUS;
+    let shore_dist = distance_to_shore(field, params.mountain_land_radius);
+    let abs_dist = shore_dist.abs().min(params.shore_mod_radius);
+    let t = abs_dist / params.shore_mod_radius;
     let ease = t * (2.0 - t);
     let modifier = if shore_dist > 0.0 {
-        ease * SHORE_MOD_UP
+        ease * params.shore_mod_up
     } else {
-        -ease * SHORE_MOD_DOWN
+        -ease * params.shore_mod_down
     };
 
     base + modifier
@@ -489,9 +510,9 @@ pub fn generate_section_data(
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    let max_noise_reach = COAST_SPREAD * params.land_width;
+    let max_noise_reach = COAST_SPREAD * params.mountain_land_radius;
     let extent = params.spine_length + params.arm_length
-        + params.land_width + max_noise_reach;
+        + params.mountain_land_radius + max_noise_reach;
     let points = generate_voronoi_points(
         seed, -extent, -extent, extent, extent,
     );
@@ -510,7 +531,7 @@ pub fn generate_section_data(
             let dist_to_border = (second - nearest) * 0.5;
 
             let (raw_dist, _ridge_elev) = skeleton.query_elevation(wx, wz, &params);
-            let field = island_field(wx, wz, raw_dist, params.land_width, seed);
+            let field = island_field(wx, wz, raw_dist, &params, seed);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
             let elevation = elevation_f as i32;
             let is_underwater = field <= 0.0;
