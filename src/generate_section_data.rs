@@ -7,6 +7,7 @@ use common::{
     default_blocks_ids::BlockID,
     CHUNK_SIZE,
 };
+use delaunator::Point;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -22,17 +23,21 @@ const ISLAND_SIZE: f64 = 400.0;
 // --- Параметры береговой линии -----------------------------------------------
 
 /// Сила влияния noise на береговую линию.
-const COAST_SPREAD: f64 = 0.7;
+const COAST_SPREAD: f64 = 0.8;
 
 /// Извилистость береговой линии (базовая частота noise).
 const COAST_FRACTAL: f64 = 0.006;
 
 // --- Постоянные параметры (не зависят от размера) ----------------------------
 
-/// Минимальная ширина суши вокруг горного хребта (в блоках).
-/// Гарантированная суша = MOUNTAIN_LAND_RADIUS * (1 - COAST_SPREAD).
-/// При 120 и spread 0.7: гарантия = 36 блоков.
-const MOUNTAIN_LAND_RADIUS: f64 = 120.0;
+/// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
+const VORONOI_CELL_SIZE: f64 = 13.0;
+
+/// Порог расстояния до границы между ячейками (в блоках)
+const BORDER_THICKNESS: f64 = 0.45;
+
+/// Высота границы над поверхностью ячейки (в блоках)
+const BORDER_HEIGHT: i32 = 1;
 
 /// Расстояние от хребта для пика горной гряды (ширина ~1 ячейки)
 const MOUNTAIN_WIDTH: f64 = 7.0;
@@ -70,10 +75,6 @@ const ARM_WOBBLE: f64 = 30.0;
 /// Ширина пляжной полосы от линии воды вглубь суши (в блоках).
 const BEACH_WIDTH: f64 = 12.0;
 
-/// Коэффициент масштабирования высоты гор от размера острова.
-/// max_height = land_width * MOUNTAIN_SCALE * sqrt(size / 400), cap MAX_PEAK_HEIGHT.
-const MOUNTAIN_SCALE: f64 = 0.35;
-
 /// Максимальное значение shore modifier на суше (в блоках).
 const SHORE_MOD_UP: f64 = 6.0;
 
@@ -83,34 +84,16 @@ const SHORE_MOD_DOWN: f64 = 3.0;
 /// Расстояние (в блоках) на котором modifier достигает максимума.
 const SHORE_MOD_RADIUS: f64 = 40.0;
 
-// --- Параметры микрорельефа поверхности --------------------------------------
-
-/// Максимальная амплитуда поверхностного шума (в блоках).
-const SURFACE_NOISE_AMPLITUDE: f64 = 6.0;
-
-/// Частота поверхностного шума (чем больше, тем мельче холмы).
-const SURFACE_NOISE_FREQUENCY: f64 = 0.015;
-
-/// Количество октав поверхностного шума.
-const SURFACE_NOISE_OCTAVES: usize = 4;
-
 // --- Производные параметры из ISLAND_SIZE ------------------------------------
 
 struct IslandParams {
     spine_length: f64,
     arm_length: f64,
     land_width: f64,
-    mountain_land_radius: f64,
     highland_width: f64,
     max_height: f64,
     /// Порог field-значения для пляжной зоны.
     beach_field_threshold: f64,
-    /// Максимальный подъём на суше от shore modifier (в блоках).
-    shore_mod_up: f64,
-    /// Максимальное углубление под водой от shore modifier (в блоках).
-    shore_mod_down: f64,
-    /// Расстояние (в блоках) на котором modifier достигает максимума.
-    shore_mod_radius: f64,
 }
 
 impl IslandParams {
@@ -118,19 +101,14 @@ impl IslandParams {
         let spine_length = size * 0.5;
         let arm_length = size * 0.3;
         let land_width = size * 0.4;
-        let mountain_land_radius = MOUNTAIN_LAND_RADIUS;
-        let max_height = (land_width * MOUNTAIN_SCALE * (size / 400.0).sqrt()).min(MAX_PEAK_HEIGHT as f64);
+        let max_height = (land_width * 0.8).min(MAX_PEAK_HEIGHT as f64);
         Self {
             spine_length,
             arm_length,
             land_width,
-            mountain_land_radius,
-            highland_width: mountain_land_radius * 0.6,
+            highland_width: land_width * 0.42,
             max_height,
-            beach_field_threshold: BEACH_WIDTH / mountain_land_radius,
-            shore_mod_up: SHORE_MOD_UP,
-            shore_mod_down: SHORE_MOD_DOWN,
-            shore_mod_radius: SHORE_MOD_RADIUS,
+            beach_field_threshold: BEACH_WIDTH / land_width,
         }
     }
 }
@@ -407,11 +385,10 @@ fn fbm_noise(x: f64, z: f64, seed: u64, octaves: usize) -> f64 {
 fn island_field(
     x: f64, z: f64,
     raw_dist: f64,
-    params: &IslandParams,
+    land_width: f64,
     seed: u64,
 ) -> f64 {
-    let ridge_field = ((params.mountain_land_radius - raw_dist) / params.mountain_land_radius)
-        .clamp(0.0, 1.0);
+    let ridge_field = ((land_width - raw_dist) / land_width).clamp(0.0, 1.0);
 
     let noise_field = fbm_noise(
         x * COAST_FRACTAL,
@@ -425,10 +402,11 @@ fn island_field(
 
 /// Оценка горизонтального расстояния до береговой линии (field=0) в блоках.
 ///
-/// Использует средний градиент field (~ 1/mountain_land_radius per block).
+/// Использует средний градиент field (~ 1/land_width per block).
 /// Результат со знаком: положительный на суше, отрицательный в океане.
-fn distance_to_shore(field: f64, mountain_land_radius: f64) -> f64 {
-    field * mountain_land_radius
+/// Гладкий, без шума от noise.
+fn distance_to_shore(field: f64, land_width: f64) -> f64 {
+    field * land_width
 }
 
 /// Единая высота для любой точки мира.
@@ -439,7 +417,7 @@ fn compute_elevation(
     seed: u64,
 ) -> f64 {
     let (raw_dist, ridge_elev) = skeleton.query_elevation(wx, wz, params);
-    let field = island_field(wx, wz, raw_dist, params, seed);
+    let field = island_field(wx, wz, raw_dist, params.land_width, seed);
 
     let base = if field > 0.0 {
         let shore_factor = field.min(1.0);
@@ -449,38 +427,17 @@ fn compute_elevation(
     };
 
     // Shore modifier: плавный подъём от берега
-    let shore_dist = distance_to_shore(field, params.mountain_land_radius);
-    let abs_dist = shore_dist.abs().min(params.shore_mod_radius);
-    let t = abs_dist / params.shore_mod_radius;
+    let shore_dist = distance_to_shore(field, params.land_width);
+    let abs_dist = shore_dist.abs().min(SHORE_MOD_RADIUS);
+    let t = abs_dist / SHORE_MOD_RADIUS;
     let ease = t * (2.0 - t);
     let modifier = if shore_dist > 0.0 {
-        ease * params.shore_mod_up
+        ease * SHORE_MOD_UP
     } else {
-        -ease * params.shore_mod_down
+        -ease * SHORE_MOD_DOWN
     };
 
-    // Поверхностный шум: плавные холмы на суше, затухает у берега и на пляже
-    let surface_noise = fbm_noise(
-        wx * SURFACE_NOISE_FREQUENCY,
-        wz * SURFACE_NOISE_FREQUENCY,
-        seed.wrapping_add(55555),
-        SURFACE_NOISE_OCTAVES,
-    );
-
-    let shore_fade = if field <= 0.0 {
-        // Под водой: слабый шум для дна
-        0.3
-    } else if field < params.beach_field_threshold {
-        // Пляж: почти плоский
-        0.0
-    } else {
-        // Суша: плавное нарастание от берега
-        ((field - params.beach_field_threshold) * 4.0).min(1.0)
-    };
-
-    let surface_mod = surface_noise * SURFACE_NOISE_AMPLITUDE * shore_fade;
-
-    base + modifier + surface_mod
+    base + modifier
 }
 
 fn classify_by_field(
@@ -519,7 +476,7 @@ pub fn generate_section_data(
     let base_y = settings.sea_level as i32;
 
     let max_depth = MAX_OCEAN_DEPTH as i32 + SHORE_MOD_DOWN as i32;
-    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + SURFACE_NOISE_AMPLITUDE as i32 + 2 {
+    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + BORDER_HEIGHT + 2 {
         return section_data;
     }
     if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - 4 {
@@ -532,13 +489,28 @@ pub fn generate_section_data(
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
+    let max_noise_reach = COAST_SPREAD * params.land_width;
+    let extent = params.spine_length + params.arm_length
+        + params.land_width + max_noise_reach;
+    let points = generate_voronoi_points(
+        seed, -extent, -extent, extent, extent,
+    );
+
+    if points.len() < 3 {
+        return section_data;
+    }
+
     for x in 0..(CHUNK_SIZE as u8) {
         for z in 0..(CHUNK_SIZE as u8) {
             let wx = chunk_wx + x as f64;
             let wz = chunk_wz + z as f64;
 
+            let (nearest, second, _nearest_idx) =
+                find_two_nearest_with_index(&points, wx, wz);
+            let dist_to_border = (second - nearest) * 0.5;
+
             let (raw_dist, _ridge_elev) = skeleton.query_elevation(wx, wz, &params);
-            let field = island_field(wx, wz, raw_dist, &params, seed);
+            let field = island_field(wx, wz, raw_dist, params.land_width, seed);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
             let elevation = elevation_f as i32;
             let is_underwater = field <= 0.0;
@@ -547,7 +519,16 @@ pub fn generate_section_data(
                 wx, wz, field, &skeleton, &params,
             );
 
-            let top_y = base_y + elevation;
+            let is_border = dist_to_border < BORDER_THICKNESS
+                && !is_underwater
+                && zone != CellZone::Beach
+                && zone != CellZone::Ocean;
+
+            let top_y = if is_border {
+                base_y + elevation + BORDER_HEIGHT
+            } else {
+                base_y + elevation
+            };
 
             for y in 0..(CHUNK_SIZE as u8) {
                 let world_y = section_y_offset + y as i32;
@@ -568,6 +549,11 @@ pub fn generate_section_data(
                         section_data.insert(
                             &pos,
                             BlockDataInfo::create(BlockID::Sand.id()),
+                        );
+                    } else if is_border {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(border_block(zone)),
                         );
                     } else {
                         section_data.insert(
@@ -610,6 +596,16 @@ fn surface_block(zone: CellZone) -> u16 {
     }
 }
 
+fn border_block(zone: CellZone) -> u16 {
+    match zone {
+        CellZone::Ocean => BlockID::Water.id(),
+        CellZone::Beach => BlockID::Sandstone.id(),
+        CellZone::Lowland => BlockID::CoarseDirt.id(),
+        CellZone::Highland => BlockID::Cobblestone.id(),
+        CellZone::Mountain => BlockID::Cobblestone.id(),
+    }
+}
+
 fn subsurface_block(zone: CellZone) -> u16 {
     match zone {
         CellZone::Ocean => BlockID::Stone.id(),
@@ -618,4 +614,58 @@ fn subsurface_block(zone: CellZone) -> u16 {
         CellZone::Highland => BlockID::Stone.id(),
         CellZone::Mountain => BlockID::Stone.id(),
     }
+}
+
+fn find_two_nearest_with_index(
+    points: &[Point], wx: f64, wz: f64,
+) -> (f64, f64, usize) {
+    let mut nearest = f64::MAX;
+    let mut second = f64::MAX;
+    let mut nearest_idx = 0;
+
+    for (i, p) in points.iter().enumerate() {
+        let dx = wx - p.x;
+        let dz = wz - p.y;
+        let dist = dx * dx + dz * dz;
+
+        if dist < nearest {
+            second = nearest;
+            nearest = dist;
+            nearest_idx = i;
+        } else if dist < second {
+            second = dist;
+        }
+    }
+
+    (nearest.sqrt(), second.sqrt(), nearest_idx)
+}
+
+fn generate_voronoi_points(
+    seed: u64,
+    min_x: f64, min_z: f64,
+    max_x: f64, max_z: f64,
+) -> Vec<Point> {
+    let mut points = Vec::new();
+    let step = VORONOI_CELL_SIZE;
+
+    let gx0 = (min_x / step).floor() as i64;
+    let gz0 = (min_z / step).floor() as i64;
+    let gx1 = (max_x / step).ceil() as i64;
+    let gz1 = (max_z / step).ceil() as i64;
+
+    for gx in gx0..=gx1 {
+        for gz in gz0..=gz1 {
+            let cell_seed = seed
+                ^ (gx as u64).wrapping_mul(6364136223846793005)
+                ^ (gz as u64).wrapping_mul(1442695040888963407);
+            let mut rng = SmallRng::seed_from_u64(cell_seed);
+
+            points.push(Point {
+                x: gx as f64 * step + rng.gen::<f64>() * step * 0.8,
+                y: gz as f64 * step + rng.gen::<f64>() * step * 0.8,
+            });
+        }
+    }
+
+    points
 }
