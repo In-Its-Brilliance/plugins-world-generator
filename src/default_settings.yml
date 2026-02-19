@@ -1,1 +1,40 @@
-sea_level: 63
+sea_level: 64
+
+island:
+  size: 400.0
+  center_offset: 100.0
+  voronoi_borders: false
+
+  coastline:
+    spread: 0.8
+    fractal: 0.006
+
+  mountains:
+    width: 7.0
+    max_peak_height: 80
+    max_ocean_depth: 20.0
+    height_ratio: 0.45
+    height_step: 6.0
+    base_up_chance: 0.35
+    max_up_chance: 0.4
+
+  terrain:
+    surface_noise_amplitude: 7.0
+    beach_width: 12.0
+
+  voronoi:
+    cell_size: 13.0
+    border_thickness: 0.45
+    border_height: 0
+
+  ridge:
+    spine_segments: 12
+    arm_segments: 8
+    arm_count: 6
+    spine_wobble: 40.0
+    arm_wobble: 30.0
+
+  shore:
+    mod_up: 6.0
+    mod_down: 3.0
+    mod_radius: 40.0

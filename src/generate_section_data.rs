@@ -14,112 +14,34 @@ use rand::{Rng, SeedableRng};
 use crate::generate_world_macro::MacroData;
 use crate::settings::GeneratorSettings;
 
-// --- Единственный параметр размера -------------------------------------------
-
-/// Общий размер острова (радиус от центра до дальнего берега, в блоках).
-/// Все производные параметры рассчитываются из этого значения.
-const ISLAND_SIZE: f64 = 400.0;
-
-// --- Параметры береговой линии -----------------------------------------------
-
-/// Сила влияния noise на береговую линию.
-const COAST_SPREAD: f64 = 0.8;
-
-/// Извилистость береговой линии (базовая частота noise).
-const COAST_FRACTAL: f64 = 0.006;
-
-// --- Постоянные параметры (не зависят от размера) ----------------------------
-
-/// Средний размер Voronoi-ячейки в блоках (шаг jittered grid)
-const VORONOI_CELL_SIZE: f64 = 13.0;
-
-/// Порог расстояния до границы между ячейками (в блоках)
-const BORDER_THICKNESS: f64 = 0.45;
-
-/// Высота границы над поверхностью ячейки (в блоках)
-const BORDER_HEIGHT: i32 = 0;
-
-/// Расстояние от хребта для пика горной гряды (ширина ~1 ячейки)
-const MOUNTAIN_WIDTH: f64 = 7.0;
-
-/// Максимальная высота горной гряды над sea_level
-const MAX_PEAK_HEIGHT: i32 = 80;
-
-/// Максимальная глубина океанского дна ниже sea_level
-const MAX_OCEAN_DEPTH: f64 = 20.0;
-
-/// Шаг изменения высоты на сегмент (в блоках)
-const HEIGHT_STEP: f64 = 6.0;
-
-/// Базовая вероятность подъёма (остальное -- спуск)
-const BASE_UP_CHANCE: f64 = 0.35;
-
-/// Максимальная вероятность подъёма (для больших островов)
-const MAX_UP_CHANCE: f64 = 0.4;
-
-/// Количество сегментов в главном хребте
-const SPINE_SEGMENTS: usize = 12;
-
-/// Сегментов в рукаве
-const ARM_SEGMENTS: usize = 8;
-
-/// Количество рукавов от главного хребта
-const ARM_COUNT: usize = 6;
-
-/// Степень извилистости хребта (макс. отклонение на сегмент)
-const SPINE_WOBBLE: f64 = 40.0;
-
-/// Извилистость рукавов
-const ARM_WOBBLE: f64 = 30.0;
-
-/// Ширина пляжной полосы от линии воды вглубь суши (в блоках).
-const BEACH_WIDTH: f64 = 12.0;
-
-/// Максимальное значение shore modifier на суше (в блоках).
-const SHORE_MOD_UP: f64 = 6.0;
-
-/// Максимальное значение shore modifier под водой (в блоках).
-const SHORE_MOD_DOWN: f64 = 3.0;
-
-/// Расстояние (в блоках) на котором modifier достигает максимума.
-const SHORE_MOD_RADIUS: f64 = 40.0;
-
-// --- Параметры микрорельефа поверхности --------------------------------------
-
-/// Максимальная амплитуда поверхностного шума (в блоках).
-const SURFACE_NOISE_AMPLITUDE: f64 = 7.0;
-
-/// Частота поверхностного шума (чем меньше, тем крупнее холмы).
-const SURFACE_NOISE_FREQUENCY: f64 = 0.008;
-
-/// Количество октав поверхностного шума.
-const SURFACE_NOISE_OCTAVES: usize = 4;
-
-// --- Производные параметры из ISLAND_SIZE ------------------------------------
+// --- Производные параметры ---------------------------------------------------
 
 struct IslandParams {
+    island_size: f64,
     spine_length: f64,
     arm_length: f64,
     land_width: f64,
     highland_width: f64,
     max_height: f64,
-    /// Порог field-значения для пляжной зоны.
     beach_field_threshold: f64,
 }
 
 impl IslandParams {
-    fn from_size(size: f64) -> Self {
+    fn from_settings(s: &GeneratorSettings) -> Self {
+        let size = s.island.size;
         let spine_length = size * 0.5;
         let arm_length = size * 0.3;
         let land_width = size * 0.4;
-        let max_height = (land_width * 0.8).min(MAX_PEAK_HEIGHT as f64);
+        let max_height = (land_width * s.island.mountains.height_ratio)
+            .min(s.island.mountains.max_peak_height as f64);
         Self {
+            island_size: size,
             spine_length,
             arm_length,
             land_width,
             highland_width: land_width * 0.42,
             max_height,
-            beach_field_threshold: BEACH_WIDTH / land_width,
+            beach_field_threshold: s.island.terrain.beach_width / land_width,
         }
     }
 }
@@ -145,12 +67,14 @@ struct Polyline {
 }
 
 impl Polyline {
-    fn nearest_point(&self, px: f64, pz: f64) -> (f64, f64) {
+    fn nearest_point(&self, px: f64, pz: f64) -> (f64, f64, f64, f64) {
         let mut best_dist = f64::MAX;
         let mut best_h = 0.0;
+        let mut best_cx = 0.0;
+        let mut best_cz = 0.0;
 
         for w in self.points.windows(2) {
-            let (d, h) = project_on_segment(
+            let (d, h, cx, cz) = project_on_segment(
                 px, pz,
                 w[0].x, w[0].z, w[0].h,
                 w[1].x, w[1].z, w[1].h,
@@ -158,10 +82,12 @@ impl Polyline {
             if d < best_dist {
                 best_dist = d;
                 best_h = h;
+                best_cx = cx;
+                best_cz = cz;
             }
         }
 
-        (best_dist, best_h)
+        (best_dist, best_h, best_cx, best_cz)
     }
 }
 
@@ -169,7 +95,7 @@ fn project_on_segment(
     px: f64, pz: f64,
     x0: f64, z0: f64, h0: f64,
     x1: f64, z1: f64, h1: f64,
-) -> (f64, f64) {
+) -> (f64, f64, f64, f64) {
     let dx = x1 - x0;
     let dz = z1 - z0;
     let len_sq = dx * dx + dz * dz;
@@ -177,7 +103,7 @@ fn project_on_segment(
     if len_sq < 1e-10 {
         let ex = px - x0;
         let ez = pz - z0;
-        return ((ex * ex + ez * ez).sqrt(), h0);
+        return ((ex * ex + ez * ez).sqrt(), h0, x0, z0);
     }
 
     let t = ((px - x0) * dx + (pz - z0) * dz) / len_sq;
@@ -188,7 +114,7 @@ fn project_on_segment(
     let ex = px - cx;
     let ez = pz - cz;
 
-    ((ex * ex + ez * ez).sqrt(), h0 + t * (h1 - h0))
+    ((ex * ex + ez * ez).sqrt(), h0 + t * (h1 - h0), cx, cz)
 }
 
 struct IslandSkeleton {
@@ -196,39 +122,47 @@ struct IslandSkeleton {
 }
 
 impl IslandSkeleton {
-    fn generate(seed: u64, params: &IslandParams) -> Self {
+    fn generate(seed: u64, params: &IslandParams, settings: &GeneratorSettings) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut polylines = Vec::new();
 
-        let island_size = params.spine_length + params.arm_length;
-        let up_chance = (BASE_UP_CHANCE
-            + (island_size / 2000.0) * (MAX_UP_CHANCE - BASE_UP_CHANCE))
-            .min(MAX_UP_CHANCE);
+        let offset = settings.island.center_offset;
+        let ox = (rng.gen::<f64>() - 0.5) * offset * 2.0;
+        let oz = (rng.gen::<f64>() - 0.5) * offset * 2.0;
 
+        let island_size = params.spine_length + params.arm_length;
+        let mtn = &settings.island.mountains;
+        let up_chance = (mtn.base_up_chance
+            + (island_size / 2000.0) * (mtn.max_up_chance - mtn.base_up_chance))
+            .min(mtn.max_up_chance);
+
+        let ridge = &settings.island.ridge;
         let spine_angle: f64 = rng.gen::<f64>() * std::f64::consts::PI;
 
         let spine_fwd = generate_ridge(
             &mut rng,
-            0.0, 0.0,
+            ox, oz,
             params.max_height,
             spine_angle,
             params.spine_length,
-            SPINE_SEGMENTS,
-            SPINE_WOBBLE,
+            ridge.spine_segments,
+            ridge.spine_wobble,
             up_chance,
             params.max_height,
+            mtn.height_step,
         );
 
         let spine_back = generate_ridge(
             &mut rng,
-            0.0, 0.0,
+            ox, oz,
             params.max_height,
             spine_angle + std::f64::consts::PI,
             params.spine_length,
-            SPINE_SEGMENTS,
-            SPINE_WOBBLE,
+            ridge.spine_segments,
+            ridge.spine_wobble,
             up_chance,
             params.max_height,
+            mtn.height_step,
         );
 
         let mut spine_points: Vec<RidgePoint> = spine_back.iter()
@@ -245,7 +179,7 @@ impl IslandSkeleton {
 
         polylines.push(Polyline { points: spine_points });
 
-        for _ in 0..ARM_COUNT {
+        for _ in 0..ridge.arm_count {
             let idx = rng.gen_range(1..all_spine.len());
             let (ax, az, ah) = all_spine[idx];
 
@@ -256,10 +190,11 @@ impl IslandSkeleton {
                 ah * 0.7,
                 arm_angle,
                 params.arm_length,
-                ARM_SEGMENTS,
-                ARM_WOBBLE,
+                ridge.arm_segments,
+                ridge.arm_wobble,
                 up_chance,
                 params.max_height,
+                mtn.height_step,
             );
 
             let arm_points: Vec<RidgePoint> = arm_raw.iter()
@@ -272,20 +207,24 @@ impl IslandSkeleton {
         Self { polylines }
     }
 
-    fn query_elevation(&self, px: f64, pz: f64, params: &IslandParams) -> (f64, f64) {
+    fn query_elevation(&self, px: f64, pz: f64, params: &IslandParams) -> (f64, f64, f64, f64) {
         let mut min_dist = f64::MAX;
         let mut best_elev = 0.0;
+        let mut ridge_cx = 0.0;
+        let mut ridge_cz = 0.0;
 
         for poly in &self.polylines {
-            let (d, h) = poly.nearest_point(px, pz);
+            let (d, h, cx, cz) = poly.nearest_point(px, pz);
 
             if d < min_dist {
                 min_dist = d;
+                ridge_cx = cx;
+                ridge_cz = cz;
             }
 
             let height_ratio = h / params.max_height;
-            let base = ISLAND_SIZE * 0.05;
-            let extra = height_ratio * height_ratio * ISLAND_SIZE * 0.07;
+            let base = params.island_size * 0.05;
+            let extra = height_ratio * height_ratio * params.island_size * 0.07;
             let dynamic_falloff = base + extra;
 
             let falloff = (-d / dynamic_falloff).exp();
@@ -295,7 +234,7 @@ impl IslandSkeleton {
             }
         }
 
-        (min_dist, best_elev)
+        (min_dist, best_elev, ridge_cx, ridge_cz)
     }
 }
 
@@ -309,6 +248,7 @@ fn generate_ridge(
     wobble: f64,
     up_chance: f64,
     max_height: f64,
+    height_step: f64,
 ) -> Vec<(f64, f64, f64)> {
     let mut points = Vec::with_capacity(num_segments + 1);
     let h0 = start_height.min(max_height);
@@ -326,13 +266,13 @@ fn generate_ridge(
         cz += current_angle.sin() * seg_length;
 
         if rng.gen::<f64>() < up_chance {
-            h += HEIGHT_STEP;
+            h += height_step;
         } else {
-            h -= HEIGHT_STEP;
+            h -= height_step;
         }
 
         if i >= num_segments - 3 {
-            h -= HEIGHT_STEP;
+            h -= height_step;
         }
 
         h = h.clamp(0.0, max_height);
@@ -342,7 +282,7 @@ fn generate_ridge(
     points
 }
 
-// --- Когерентный noise для береговой линии ------------------------------------
+// --- Когерентный noise -------------------------------------------------------
 
 fn hash_2d(ix: i64, iz: i64, seed: u64) -> f64 {
     let mut h = seed;
@@ -398,68 +338,294 @@ fn island_field(
     raw_dist: f64,
     land_width: f64,
     seed: u64,
+    settings: &GeneratorSettings,
 ) -> f64 {
     let ridge_field = ((land_width - raw_dist) / land_width).clamp(0.0, 1.0);
 
+    let coast = &settings.island.coastline;
     let noise_field = fbm_noise(
-        x * COAST_FRACTAL,
-        z * COAST_FRACTAL,
+        x * coast.fractal,
+        z * coast.fractal,
         seed.wrapping_add(7777),
         6,
     );
 
-    ridge_field + noise_field * COAST_SPREAD
+    ridge_field + noise_field * coast.spread
 }
 
-/// Оценка горизонтального расстояния до береговой линии (field=0) в блоках.
-///
-/// Использует средний градиент field (~ 1/land_width per block).
-/// Результат со знаком: положительный на суше, отрицательный в океане.
-/// Гладкий, без шума от noise.
 fn distance_to_shore(field: f64, land_width: f64) -> f64 {
     field * land_width
 }
 
-/// Единая высота для любой точки мира.
+/// Информация о дереве для размещения.
+struct TreeInstance {
+    /// Мировая координата X основания ствола.
+    wx: i32,
+    /// Мировая координата Z основания ствола.
+    wz: i32,
+    /// Мировая координата Y основания ствола (top_y + 1).
+    wy: i32,
+    /// Seed для генерации формы этого дерева.
+    tree_seed: u64,
+}
+
+/// Блок дерева относительно основания ствола.
+struct TreeBlock {
+    dx: i32,
+    dy: i32,
+    dz: i32,
+    block_id: u16,
+}
+
+/// Генерирует форму ели: ствол + конусообразная крона с ярусами.
+fn generate_tree(tree_seed: u64) -> Vec<TreeBlock> {
+    let mut rng = SmallRng::seed_from_u64(tree_seed);
+    let mut blocks = Vec::new();
+
+    let trunk_height = 6 + (rng.gen::<f64>() * 6.0) as i32;
+    let crown_start = 2 + (rng.gen::<f64>() * 2.0) as i32;
+    let crown_top = trunk_height + 2;
+    let max_radius = 3 + (rng.gen::<f64>() * 2.0) as i32;
+
+    // Ствол
+    for y in 0..trunk_height {
+        blocks.push(TreeBlock {
+            dx: 0, dy: y, dz: 0,
+            block_id: BlockID::SpruceLog.id(),
+        });
+    }
+
+    // Верхушка -- 1-2 блока листвы над стволом
+    for y in trunk_height..=crown_top {
+        blocks.push(TreeBlock {
+            dx: 0, dy: y, dz: 0,
+            block_id: BlockID::SpruceLeaves.id(),
+        });
+    }
+
+    // Ярусы кроны снизу вверх
+    let crown_height = crown_top - crown_start;
+    let mut y = crown_start;
+    while y <= trunk_height {
+        let t = (y - crown_start) as f64 / crown_height as f64;
+        // Радиус: максимальный внизу, сужается к верху
+        let r = ((1.0 - t) * max_radius as f64 + 0.5) as i32;
+        if r < 1 {
+            y += 1;
+            continue;
+        }
+
+        for dx in -r..=r {
+            for dz in -r..=r {
+                let dist_sq = dx * dx + dz * dz;
+                if dist_sq > r * r {
+                    continue;
+                }
+                if dx == 0 && dz == 0 {
+                    continue;
+                }
+                // Случайные дыры на краях
+                let hole_hash = tree_seed
+                    .wrapping_add(dx as u64 * 73856093)
+                    .wrapping_add(y as u64 * 19349663)
+                    .wrapping_add(dz as u64 * 83492791);
+                let edge = dist_sq as f64 / (r * r) as f64;
+                if edge > 0.7 && (hole_hash % 10) < 3 {
+                    continue;
+                }
+                blocks.push(TreeBlock {
+                    dx, dy: y, dz,
+                    block_id: BlockID::SpruceLeaves.id(),
+                });
+            }
+        }
+
+        // Пробел между ярусами через каждые 2 слоя
+        y += if r > 2 { 2 } else { 1 };
+    }
+
+    blocks
+}
+
+/// Собирает все деревья, которые могут повлиять на данный чанк.
+/// Проверяет ячейки grid в радиусе MAX_TREE_REACH от границ чанка.
+fn collect_trees_near_chunk(
+    chunk_wx: f64,
+    chunk_wz: f64,
+    seed: u64,
+    skeleton: &IslandSkeleton,
+    params: &IslandParams,
+    settings: &GeneratorSettings,
+    base_y: i32,
+) -> Vec<TreeInstance> {
+    let cell_size = 4.0;
+    let reach = 10.0;
+    let chunk_size = CHUNK_SIZE as f64;
+
+    let min_x = chunk_wx - reach;
+    let min_z = chunk_wz - reach;
+    let max_x = chunk_wx + chunk_size + reach;
+    let max_z = chunk_wz + chunk_size + reach;
+
+    let gx0 = (min_x / cell_size).floor() as i64;
+    let gz0 = (min_z / cell_size).floor() as i64;
+    let gx1 = (max_x / cell_size).ceil() as i64;
+    let gz1 = (max_z / cell_size).ceil() as i64;
+
+    let mtn = &settings.island.mountains;
+    let mut trees = Vec::new();
+
+    for gx in gx0..=gx1 {
+        for gz in gz0..=gz1 {
+            let cx = gx as f64 * cell_size + cell_size * 0.5;
+            let cz = gz as f64 * cell_size + cell_size * 0.5;
+            let forest_noise = fbm_noise(
+                cx * 0.025,
+                cz * 0.025,
+                seed.wrapping_add(33333),
+                2,
+            );
+            if forest_noise < 0.15 {
+                continue;
+            }
+            let density = ((forest_noise - 0.15) / 0.25).min(1.0) * 0.95;
+
+            let cell_seed = seed.wrapping_add(12345)
+                ^ (gx as u64).wrapping_mul(6364136223846793005)
+                ^ (gz as u64).wrapping_mul(1442695040888963407);
+            let mut rng = SmallRng::seed_from_u64(cell_seed);
+
+            if rng.gen::<f64>() > density {
+                continue;
+            }
+
+            let tree_x = (gx as f64 * cell_size + 1.0 + rng.gen::<f64>() * (cell_size - 2.0)).floor();
+            let tree_z = (gz as f64 * cell_size + 1.0 + rng.gen::<f64>() * (cell_size - 2.0)).floor();
+
+            // Проверка: дерево на суше, плоское место
+            let (raw_dist, _, _, _) = skeleton.query_elevation(tree_x, tree_z, params);
+            let field = island_field(tree_x, tree_z, raw_dist, params.land_width, seed, settings);
+            if field <= params.beach_field_threshold {
+                continue;
+            }
+
+            let elevation_f = compute_elevation(tree_x, tree_z, skeleton, params, seed, settings);
+            let elev_px = compute_elevation(tree_x + 1.0, tree_z, skeleton, params, seed, settings);
+            let elev_pz = compute_elevation(tree_x, tree_z + 1.0, skeleton, params, seed, settings);
+            let slope = ((elev_px - elevation_f).powi(2) + (elev_pz - elevation_f).powi(2)).sqrt();
+            if slope > 0.3 {
+                continue;
+            }
+
+            let zone = classify_by_field(
+                tree_x, tree_z, field, skeleton, params, mtn.width,
+            );
+            if zone != CellZone::Lowland {
+                continue;
+            }
+
+            trees.push(TreeInstance {
+                wx: tree_x as i32,
+                wz: tree_z as i32,
+                wy: base_y + elevation_f as i32 + 1,
+                tree_seed: cell_seed.wrapping_add(99999),
+            });
+        }
+    }
+
+    trees
+}
+
+/// Расстояние до ближайшего дерева (для затемнения травы).
+/// Проверяет 9 ячеек вокруг точки.
+fn distance_to_nearest_tree(wx: f64, wz: f64, seed: u64) -> f64 {
+    let cell_size = 4.0;
+    let gx = (wx / cell_size).floor() as i64;
+    let gz = (wz / cell_size).floor() as i64;
+
+    let mut min_dist_sq = f64::MAX;
+
+    for dg_x in -1..=1 {
+        for dg_z in -1..=1 {
+            let cgx = gx + dg_x;
+            let cgz = gz + dg_z;
+
+            // Проверка forest noise для этой ячейки
+            let cx = cgx as f64 * cell_size + cell_size * 0.5;
+            let cz = cgz as f64 * cell_size + cell_size * 0.5;
+            let forest_noise = fbm_noise(
+                cx * 0.025,
+                cz * 0.025,
+                seed.wrapping_add(33333),
+                2,
+            );
+            if forest_noise < 0.15 {
+                continue;
+            }
+            let density = ((forest_noise - 0.15) / 0.25).min(1.0) * 0.95;
+
+            let cell_seed = seed.wrapping_add(12345)
+                ^ (cgx as u64).wrapping_mul(6364136223846793005)
+                ^ (cgz as u64).wrapping_mul(1442695040888963407);
+            let mut rng = SmallRng::seed_from_u64(cell_seed);
+
+            if rng.gen::<f64>() > density {
+                continue;
+            }
+
+            let tree_x = (cgx as f64 * cell_size + 1.0 + rng.gen::<f64>() * (cell_size - 2.0)).floor() + 0.5;
+            let tree_z = (cgz as f64 * cell_size + 1.0 + rng.gen::<f64>() * (cell_size - 2.0)).floor() + 0.5;
+
+            let dx = wx - tree_x;
+            let dz = wz - tree_z;
+            let d = dx * dx + dz * dz;
+            if d < min_dist_sq {
+                min_dist_sq = d;
+            }
+        }
+    }
+
+    min_dist_sq.sqrt()
+}
+
 fn compute_elevation(
     wx: f64, wz: f64,
     skeleton: &IslandSkeleton,
     params: &IslandParams,
     seed: u64,
+    settings: &GeneratorSettings,
 ) -> f64 {
-    let (raw_dist, ridge_elev) = skeleton.query_elevation(wx, wz, params);
-    let field = island_field(wx, wz, raw_dist, params.land_width, seed);
+    let (raw_dist, ridge_elev, _, _) = skeleton.query_elevation(wx, wz, params);
+    let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
+
+    let mtn = &settings.island.mountains;
+    let shore = &settings.island.shore;
 
     let base = if field > 0.0 {
         let shore_factor = field.min(1.0);
         ridge_elev * shore_factor
     } else {
-        field * MAX_OCEAN_DEPTH
+        field * mtn.max_ocean_depth
     };
 
-    // Shore modifier: плавный подъём от берега
     let shore_dist = distance_to_shore(field, params.land_width);
-    let abs_dist = shore_dist.abs().min(SHORE_MOD_RADIUS);
-    let t = abs_dist / SHORE_MOD_RADIUS;
+    let abs_dist = shore_dist.abs().min(shore.mod_radius);
+    let t = abs_dist / shore.mod_radius;
     let ease = t * (2.0 - t);
     let modifier = if shore_dist > 0.0 {
-        ease * SHORE_MOD_UP
+        ease * shore.mod_up
     } else {
-        -ease * SHORE_MOD_DOWN
+        -ease * shore.mod_down
     };
 
-    // Поверхностный шум: непрерывный волнистый рельеф
     let raw_noise = fbm_noise(
         wx * 0.012,
         wz * 0.012,
         seed.wrapping_add(55555),
         4,
     );
-
-    // Плавные складки: только положительная часть noise
     let hills = raw_noise.max(0.0) * raw_noise.max(0.0) * 30.0;
 
-    // Мелкая детализация
     let detail_noise = fbm_noise(
         wx * 0.025,
         wz * 0.025,
@@ -468,7 +634,6 @@ fn compute_elevation(
     );
     let detail = detail_noise.max(0.0) * 4.0;
 
-    // Только пляж плоский, всё остальное -- рельеф
     let shore_fade = if field <= params.beach_field_threshold {
         0.0
     } else {
@@ -485,6 +650,7 @@ fn classify_by_field(
     field: f64,
     skeleton: &IslandSkeleton,
     params: &IslandParams,
+    mountain_width: f64,
 ) -> CellZone {
     if field <= 0.0 {
         return CellZone::Ocean;
@@ -494,8 +660,8 @@ fn classify_by_field(
         return CellZone::Beach;
     }
 
-    let (raw_dist, _) = skeleton.query_elevation(wx, wz, params);
-    if raw_dist <= MOUNTAIN_WIDTH {
+    let (raw_dist, _, _, _) = skeleton.query_elevation(wx, wz, params);
+    if raw_dist <= mountain_width {
         CellZone::Mountain
     } else if raw_dist <= params.highland_width {
         CellZone::Highland
@@ -515,28 +681,38 @@ pub fn generate_section_data(
     let section_y_offset = vertical_index as i32 * CHUNK_SIZE as i32;
     let base_y = settings.sea_level as i32;
 
-    let max_depth = MAX_OCEAN_DEPTH as i32 + SHORE_MOD_DOWN as i32;
-    if section_y_offset > base_y + MAX_PEAK_HEIGHT + SHORE_MOD_UP as i32 + SURFACE_NOISE_AMPLITUDE as i32 + BORDER_HEIGHT + 2 {
+    let mtn = &settings.island.mountains;
+    let shore = &settings.island.shore;
+    let voronoi = &settings.island.voronoi;
+    let noise_amp = settings.island.terrain.surface_noise_amplitude as i32;
+
+    let max_depth = mtn.max_ocean_depth as i32 + shore.mod_down as i32;
+    let max_tree_height = 22;
+    if section_y_offset > base_y + mtn.max_peak_height + shore.mod_up as i32 + noise_amp + voronoi.border_height + max_tree_height {
         return section_data;
     }
-    if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - SURFACE_NOISE_AMPLITUDE as i32 - 4 {
+    if section_y_offset + CHUNK_SIZE as i32 <= base_y - max_depth - noise_amp - 4 {
         return section_data;
     }
 
-    let params = IslandParams::from_size(ISLAND_SIZE);
-    let skeleton = IslandSkeleton::generate(seed, &params);
+    let params = IslandParams::from_settings(settings);
+    let skeleton = IslandSkeleton::generate(seed, &params, settings);
 
     let chunk_wx = chunk_position.x as f64 * CHUNK_SIZE as f64;
     let chunk_wz = chunk_position.z as f64 * CHUNK_SIZE as f64;
 
-    let max_noise_reach = COAST_SPREAD * params.land_width;
+    let max_noise_reach = settings.island.coastline.spread * params.land_width;
     let extent = params.spine_length + params.arm_length
         + params.land_width + max_noise_reach;
-    let points = generate_voronoi_points(
-        seed, -extent, -extent, extent, extent,
-    );
 
-    if points.len() < 3 {
+    let show_borders = settings.island.voronoi_borders;
+    let points = if show_borders {
+        generate_voronoi_points(seed, -extent, -extent, extent, extent, voronoi.cell_size)
+    } else {
+        Vec::new()
+    };
+
+    if show_borders && points.len() < 3 {
         return section_data;
     }
 
@@ -545,27 +721,51 @@ pub fn generate_section_data(
             let wx = chunk_wx + x as f64;
             let wz = chunk_wz + z as f64;
 
-            let (nearest, second, _nearest_idx) =
-                find_two_nearest_with_index(&points, wx, wz);
-            let dist_to_border = (second - nearest) * 0.5;
-
-            let (raw_dist, _ridge_elev) = skeleton.query_elevation(wx, wz, &params);
-            let field = island_field(wx, wz, raw_dist, params.land_width, seed);
-            let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed);
+            let (raw_dist, _, _, _) = skeleton.query_elevation(wx, wz, &params);
+            let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
+            let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed, settings);
             let elevation = elevation_f as i32;
             let is_underwater = field <= 0.0;
 
+            let elev_px = compute_elevation(wx + 1.0, wz, &skeleton, &params, seed, settings);
+            let elev_pz = compute_elevation(wx, wz + 1.0, &skeleton, &params, seed, settings);
+            let slope = ((elev_px - elevation_f).powi(2) + (elev_pz - elevation_f).powi(2)).sqrt();
+
             let zone = classify_by_field(
-                wx, wz, field, &skeleton, &params,
+                wx, wz, field, &skeleton, &params, mtn.width,
             );
 
-            let is_border = dist_to_border < BORDER_THICKNESS
-                && !is_underwater
-                && zone != CellZone::Beach
-                && zone != CellZone::Ocean;
+            // Цвет травы: noise + затемнение около деревьев
+            let color_noise = fbm_noise(
+                wx * 0.02,
+                wz * 0.02,
+                seed.wrapping_add(44444),
+                3,
+            );
+            let base_color = (color_noise + 0.5) * 8.0;
+
+            // Затемнение травы рядом с деревьями
+            let tree_dist = distance_to_nearest_tree(wx, wz, seed);
+            let tree_darken = if tree_dist < 5.0 {
+                (1.0 - tree_dist / 5.0) * 4.0
+            } else {
+                0.0
+            };
+            let grass_color = (base_color + tree_darken).clamp(0.0, 7.0) as u8;
+
+            let is_border = if show_borders {
+                let (nearest, second, _) = find_two_nearest_with_index(&points, wx, wz);
+                let dist_to_border = (second - nearest) * 0.5;
+                dist_to_border < voronoi.border_thickness
+                    && !is_underwater
+                    && zone != CellZone::Beach
+                    && zone != CellZone::Ocean
+            } else {
+                false
+            };
 
             let top_y = if is_border {
-                base_y + elevation + BORDER_HEIGHT
+                base_y + elevation + voronoi.border_height
             } else {
                 base_y + elevation
             };
@@ -593,13 +793,15 @@ pub fn generate_section_data(
                     } else if is_border {
                         section_data.insert(
                             &pos,
-                            BlockDataInfo::create(border_block(zone)),
+                            BlockDataInfo::create(border_block(zone, slope)),
                         );
                     } else {
-                        section_data.insert(
-                            &pos,
-                            BlockDataInfo::create(surface_block(zone)),
-                        );
+                        let (block_id, color) = surface_block(zone, slope, grass_color);
+                        let mut block = BlockDataInfo::create(block_id);
+                        if let Some(c) = color {
+                            block = block.color(c);
+                        }
+                        section_data.insert(&pos, block);
                     }
                 } else if world_y >= top_y - 3 {
                     if is_underwater {
@@ -623,26 +825,82 @@ pub fn generate_section_data(
         }
     }
 
+    // --- Деревья: собираем все в радиусе, генерируем блоки ---
+    let trees = collect_trees_near_chunk(
+        chunk_wx, chunk_wz, seed,
+        &skeleton, &params, settings, base_y,
+    );
+
+    let chunk_x0 = chunk_wx as i32;
+    let chunk_z0 = chunk_wz as i32;
+    let chunk_x1 = chunk_x0 + CHUNK_SIZE as i32;
+    let chunk_z1 = chunk_z0 + CHUNK_SIZE as i32;
+    let section_y_min = section_y_offset;
+    let section_y_max = section_y_offset + CHUNK_SIZE as i32;
+
+    for tree in &trees {
+        let tree_blocks = generate_tree(tree.tree_seed);
+        for tb in &tree_blocks {
+            let bx = tree.wx + tb.dx;
+            let by = tree.wy + tb.dy;
+            let bz = tree.wz + tb.dz;
+
+            if bx < chunk_x0 || bx >= chunk_x1 { continue; }
+            if bz < chunk_z0 || bz >= chunk_z1 { continue; }
+            if by < section_y_min || by >= section_y_max { continue; }
+
+            let lx = (bx - chunk_x0) as u8;
+            let ly = (by - section_y_min) as u8;
+            let lz = (bz - chunk_z0) as u8;
+
+            let pos = ChunkBlockPosition::new(lx, ly, lz);
+            section_data.insert(
+                &pos,
+                BlockDataInfo::create(tb.block_id),
+            );
+        }
+    }
+
     section_data
 }
 
-fn surface_block(zone: CellZone) -> u16 {
+fn surface_block(zone: CellZone, slope: f64, grass_color: u8) -> (u16, Option<u8>) {
     match zone {
-        CellZone::Ocean => BlockID::Water.id(),
-        CellZone::Beach => BlockID::Sand.id(),
-        CellZone::Lowland => BlockID::Grass.id(),
-        CellZone::Highland => BlockID::Podzol.id(),
-        CellZone::Mountain => BlockID::IronBlock.id(),
+        CellZone::Ocean => (BlockID::Water.id(), None),
+        CellZone::Beach => (BlockID::Sand.id(), None),
+        CellZone::Lowland => {
+            if slope > 0.8 {
+                (BlockID::CoarseDirt.id(), None)
+            } else {
+                (BlockID::Grass.id(), Some(grass_color))
+            }
+        }
+        CellZone::Highland | CellZone::Mountain => {
+            if slope > 1.2 {
+                (BlockID::Stone.id(), None)
+            } else if slope > 0.6 {
+                (BlockID::Cobblestone.id(), None)
+            } else if slope > 0.3 {
+                (BlockID::CoarseDirt.id(), None)
+            } else {
+                (BlockID::Grass.id(), Some(grass_color))
+            }
+        }
     }
 }
 
-fn border_block(zone: CellZone) -> u16 {
+fn border_block(zone: CellZone, slope: f64) -> u16 {
     match zone {
         CellZone::Ocean => BlockID::Water.id(),
         CellZone::Beach => BlockID::Sandstone.id(),
         CellZone::Lowland => BlockID::CoarseDirt.id(),
-        CellZone::Highland => BlockID::Cobblestone.id(),
-        CellZone::Mountain => BlockID::Cobblestone.id(),
+        CellZone::Highland | CellZone::Mountain => {
+            if slope > 0.6 {
+                BlockID::Stone.id()
+            } else {
+                BlockID::Cobblestone.id()
+            }
+        }
     }
 }
 
@@ -651,8 +909,7 @@ fn subsurface_block(zone: CellZone) -> u16 {
         CellZone::Ocean => BlockID::Stone.id(),
         CellZone::Beach => BlockID::Sandstone.id(),
         CellZone::Lowland => BlockID::CoarseDirt.id(),
-        CellZone::Highland => BlockID::Stone.id(),
-        CellZone::Mountain => BlockID::Stone.id(),
+        CellZone::Highland | CellZone::Mountain => BlockID::Stone.id(),
     }
 }
 
@@ -684,9 +941,10 @@ fn generate_voronoi_points(
     seed: u64,
     min_x: f64, min_z: f64,
     max_x: f64, max_z: f64,
+    cell_size: f64,
 ) -> Vec<Point> {
     let mut points = Vec::new();
-    let step = VORONOI_CELL_SIZE;
+    let step = cell_size;
 
     let gx0 = (min_x / step).floor() as i64;
     let gz0 = (min_z / step).floor() as i64;
