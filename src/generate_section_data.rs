@@ -179,8 +179,8 @@ impl IslandSkeleton {
         let mut polylines = Vec::new();
 
         let offset = settings.island.center_offset;
-        let ox = (rng.gen::<f64>() - 0.5) * offset * 2.0;
-        let oz = (rng.gen::<f64>() - 0.5) * offset * 2.0;
+        let ox = params.island_size * 0.5 + (rng.gen::<f64>() - 0.5) * offset * 2.0;
+        let oz = params.island_size * 0.5 + (rng.gen::<f64>() - 0.5) * offset * 2.0;
 
         let island_size = params.spine_length + params.arm_length;
         let mtn = &settings.island.mountains;
@@ -1336,7 +1336,10 @@ pub fn generate_section_data(
             let pos = ChunkBlockPosition::new(x, ly, z);
             section_data.insert(
                 &pos,
-                BlockDataInfo::create(foliage_id),
+                BlockDataInfo::create(foliage_id).random_face(
+                    seed.wrapping_add(iwx as u64 * 73856093)
+                        .wrapping_add(iwz as u64 * 83492791)
+                ),
             );
         }
     }
