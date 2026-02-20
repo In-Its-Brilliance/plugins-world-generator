@@ -119,6 +119,58 @@ fn project_on_segment(
 
 struct IslandSkeleton {
     polylines: Vec<Polyline>,
+    rivers: Vec<RiverPath>,
+}
+
+/// Точка реки с позицией, высотой и шириной русла.
+#[derive(Clone, Copy)]
+struct RiverPoint {
+    x: f64,
+    z: f64,
+    elevation: f64,
+    width: f64,
+}
+
+/// Река -- полилиния от истока (на хребте) до устья (у берега).
+struct RiverPath {
+    points: Vec<RiverPoint>,
+}
+
+impl RiverPath {
+    /// Возвращает (расстояние до русла, ширина русла, высота дна) для точки.
+    fn query(&self, px: f64, pz: f64) -> (f64, f64, f64) {
+        let mut best_dist = f64::MAX;
+        let mut best_width = 0.0;
+        let mut best_elev = 0.0;
+
+        for w in self.points.windows(2) {
+            let (d, _h, _cx, _cz) = project_on_segment(
+                px, pz,
+                w[0].x, w[0].z, w[0].elevation,
+                w[1].x, w[1].z, w[1].elevation,
+            );
+
+            // Интерполяция ширины по t
+            let dx = w[1].x - w[0].x;
+            let dz = w[1].z - w[0].z;
+            let len_sq = dx * dx + dz * dz;
+            let t = if len_sq > 1e-10 {
+                (((px - w[0].x) * dx + (pz - w[0].z) * dz) / len_sq).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let seg_width = w[0].width + t * (w[1].width - w[0].width);
+            let seg_elev = w[0].elevation + t * (w[1].elevation - w[0].elevation);
+
+            if d < best_dist {
+                best_dist = d;
+                best_width = seg_width;
+                best_elev = seg_elev;
+            }
+        }
+
+        (best_dist, best_width, best_elev)
+    }
 }
 
 impl IslandSkeleton {
@@ -204,7 +256,185 @@ impl IslandSkeleton {
             polylines.push(Polyline { points: arm_points });
         }
 
-        Self { polylines }
+        // --- Генерация рек ---
+        let mut rivers = Vec::new();
+        let river_count = 2 + (params.island_size / 600.0) as usize;
+
+        for ri in 0..river_count {
+            let river_seed = seed.wrapping_add(50000 + ri as u64 * 7919);
+            let mut river_rng = SmallRng::seed_from_u64(river_seed);
+
+            // Выбираем случайную точку на хребте
+            let spine_idx = river_rng.gen_range(2..all_spine.len().saturating_sub(2).max(3));
+            let (sx, sz, _sh) = all_spine[spine_idx];
+
+            // Направление: перпендикулярно хребту
+            let prev = if spine_idx > 0 { spine_idx - 1 } else { 0 };
+            let next = if spine_idx + 1 < all_spine.len() { spine_idx + 1 } else { spine_idx };
+            let spine_dx = all_spine[next].0 - all_spine[prev].0;
+            let spine_dz = all_spine[next].2 - all_spine[prev].2;
+            let spine_len = (spine_dx * spine_dx + spine_dz * spine_dz).sqrt().max(1.0);
+
+            let side = if river_rng.gen::<bool>() { 1.0 } else { -1.0 };
+            let perp_x = -spine_dz / spine_len * side;
+            let perp_z = spine_dx / spine_len * side;
+
+            // Сдвигаем исток от хребта на расстояние highland_width
+            // (река начинается у подножия гор, не на вершине)
+            let source_offset = params.highland_width * (0.8 + river_rng.gen::<f64>() * 0.4);
+            let start_x = sx + perp_x * source_offset;
+            let start_z = sz + perp_z * source_offset;
+
+            // Проверяем что исток на суше
+            let (rd, re, _, _) = Self::query_elevation_static(
+                &polylines, start_x, start_z, params,
+            );
+            let fld = island_field(start_x, start_z, rd, params.land_width, seed, settings);
+            if fld <= 0.1 || re < 5.0 {
+                continue;
+            }
+
+            let base_angle = perp_z.atan2(perp_x);
+            let angle_offset = (river_rng.gen::<f64>() - 0.5) * 0.6;
+            let mut current_angle = base_angle + angle_offset;
+
+            let mut points = Vec::new();
+            let mut cx = start_x;
+            let mut cz = start_z;
+            let start_width = 3.0 + river_rng.gen::<f64>() * 1.0;
+            let max_width = 10.0 + river_rng.gen::<f64>() * 6.0;
+            let seg_length = 14.0 + river_rng.gen::<f64>() * 6.0;
+            let max_segments = 60;
+            let mut prev_elev = f64::MAX;
+            let mut accumulated_dist = 0.0;
+
+            for _si in 0..max_segments {
+                let (rd, re, _, _) = Self::query_elevation_static(
+                    &polylines, cx, cz, params,
+                );
+                let fld = island_field(cx, cz, rd, params.land_width, seed, settings);
+
+                // Ширина растёт по мере удаления от истока (квадратичное расширение)
+                let total_est_length = max_segments as f64 * seg_length;
+                let t = (accumulated_dist / total_est_length).clamp(0.0, 1.0);
+                let t_smooth = t * (2.0 - t); // ease-out: быстрее расширяется к концу
+                let width = start_width + t_smooth * (max_width - start_width);
+
+                let terrain_h = if fld > 0.0 {
+                    let shore_factor = fld.min(1.0);
+                    re * shore_factor
+                } else {
+                    0.0
+                };
+
+                // Высота дна монотонно убывает
+                let river_depth = 2.0 + width * 0.4;
+                let desired_elev = (terrain_h - river_depth).max(-2.0);
+                let river_elev = if prev_elev < f64::MAX {
+                    desired_elev.min(prev_elev - 0.3)
+                } else {
+                    desired_elev
+                };
+                prev_elev = river_elev;
+
+                points.push(RiverPoint {
+                    x: cx,
+                    z: cz,
+                    elevation: river_elev,
+                    width,
+                });
+
+                // Река дошла до океана (продолжаем немного в воду)
+                if fld <= -0.1 {
+                    break;
+                }
+
+                // --- Следующий сегмент ---
+                // Умеренный wobble для меандров
+                current_angle += (river_rng.gen::<f64>() - 0.5) * 0.6;
+
+                // Подтягиваем к градиенту (вниз по склону)
+                let probe = 20.0;
+                let best_angle = {
+                    let mut best_h = f64::MAX;
+                    let mut best_a = current_angle;
+
+                    // Проверяем 5 направлений
+                    for di in -2..=2 {
+                        let test_angle = current_angle + di as f64 * 0.3;
+                        let tx = cx + test_angle.cos() * probe;
+                        let tz = cz + test_angle.sin() * probe;
+                        let (rd_t, re_t, _, _) = Self::query_elevation_static(
+                            &polylines, tx, tz, params,
+                        );
+                        let fld_t = island_field(
+                            tx, tz, rd_t, params.land_width, seed, settings,
+                        );
+                        let h_t = if fld_t > 0.0 { re_t * fld_t.min(1.0) } else { -5.0 };
+
+                        if h_t < best_h {
+                            best_h = h_t;
+                            best_a = test_angle;
+                        }
+                    }
+                    best_a
+                };
+
+                // Смешиваем текущее направление с градиентом (70% градиент)
+                let da = best_angle - current_angle;
+                let da = da - (da / std::f64::consts::TAU).round() * std::f64::consts::TAU;
+                current_angle += da * 0.7;
+
+                let next_x = cx + current_angle.cos() * seg_length;
+                let next_z = cz + current_angle.sin() * seg_length;
+                let dx = next_x - cx;
+                let dz = next_z - cz;
+                accumulated_dist += (dx * dx + dz * dz).sqrt();
+                cx = next_x;
+                cz = next_z;
+            }
+
+            if points.len() >= 3 {
+                rivers.push(RiverPath { points });
+            }
+        }
+
+        Self { polylines, rivers }
+    }
+
+    /// Статический query без self -- для использования во время генерации рек.
+    fn query_elevation_static(
+        polylines: &[Polyline],
+        px: f64, pz: f64,
+        params: &IslandParams,
+    ) -> (f64, f64, f64, f64) {
+        let mut min_dist = f64::MAX;
+        let mut best_elev = 0.0;
+        let mut ridge_cx = 0.0;
+        let mut ridge_cz = 0.0;
+
+        for poly in polylines {
+            let (d, h, cx, cz) = poly.nearest_point(px, pz);
+
+            if d < min_dist {
+                min_dist = d;
+                ridge_cx = cx;
+                ridge_cz = cz;
+            }
+
+            let height_ratio = h / params.max_height;
+            let base = params.island_size * 0.05;
+            let extra = height_ratio * height_ratio * params.island_size * 0.07;
+            let dynamic_falloff = base + extra;
+
+            let falloff = (-d / dynamic_falloff).exp();
+            let elev = falloff * h;
+            if elev > best_elev {
+                best_elev = elev;
+            }
+        }
+
+        (min_dist, best_elev, ridge_cx, ridge_cz)
     }
 
     fn query_elevation(&self, px: f64, pz: f64, params: &IslandParams) -> (f64, f64, f64, f64) {
@@ -235,6 +465,24 @@ impl IslandSkeleton {
         }
 
         (min_dist, best_elev, ridge_cx, ridge_cz)
+    }
+
+    /// Возвращает (расстояние до ближайшей реки, ширина русла, высота дна).
+    fn query_river(&self, px: f64, pz: f64) -> (f64, f64, f64) {
+        let mut best_dist = f64::MAX;
+        let mut best_width = 0.0;
+        let mut best_elev = 0.0;
+
+        for river in &self.rivers {
+            let (d, w, e) = river.query(px, pz);
+            if d < best_dist {
+                best_dist = d;
+                best_width = w;
+                best_elev = e;
+            }
+        }
+
+        (best_dist, best_width, best_elev)
     }
 }
 
@@ -524,6 +772,12 @@ fn collect_trees_near_chunk(
                 continue;
             }
 
+            // Не спавним деревья в реке или на берегу
+            let (tr_dist, tr_width, _) = skeleton.query_river(tree_x, tree_z);
+            if tr_dist < tr_width * 0.5 + 3.0 {
+                continue;
+            }
+
             trees.push(TreeInstance {
                 wx: tree_x as i32,
                 wz: tree_z as i32,
@@ -645,8 +899,8 @@ fn compute_elevation(
     let total = base + modifier + surface_mod;
 
     // --- Эрозионные борозды на горах ---
-    // Радиальные канавки, расходящиеся от хребта как кулуары
-    let erosion = if total > 6.0 {
+    // Только близко к хребту (горная зона)
+    let erosion = if total > 15.0 && raw_dist < params.highland_width * 0.8 {
         let to_x = wx - ridge_cx;
         let to_z = wz - ridge_cz;
         let dist_from_ridge = (to_x * to_x + to_z * to_z).sqrt().max(0.1);
@@ -689,47 +943,9 @@ fn compute_elevation(
         0.0
     };
 
-    total - erosion
-}
+    let after_erosion = total - erosion;
 
-/// Сила эрозии в точке (0.0 .. ~1.0). Используется и для высоты, и для выбора блока.
-fn erosion_strength(
-    wx: f64, wz: f64,
-    raw_dist: f64,
-    ridge_elev: f64,
-    ridge_cx: f64, ridge_cz: f64,
-    params: &IslandParams,
-    seed: u64,
-) -> f64 {
-    if ridge_elev <= 15.0 || raw_dist >= params.highland_width {
-        return 0.0;
-    }
-
-    let to_ridge_x = ridge_cx - wx;
-    let to_ridge_z = ridge_cz - wz;
-    let to_ridge_len = (to_ridge_x * to_ridge_x + to_ridge_z * to_ridge_z)
-        .sqrt()
-        .max(1.0);
-
-    let dir_x = to_ridge_x / to_ridge_len;
-    let dir_z = to_ridge_z / to_ridge_len;
-
-    let along = wx * dir_x + wz * dir_z;
-    let across = wx * (-dir_z) + wz * dir_x;
-
-    let erosion_noise = fbm_noise(
-        along * 0.01,
-        across * 0.08,
-        seed.wrapping_add(77777),
-        4,
-    );
-
-    let groove = (-erosion_noise).max(0.0);
-
-    let height_factor = ((ridge_elev - 15.0) / 30.0).clamp(0.0, 1.0);
-    let dist_factor = (1.0 - raw_dist / params.highland_width).clamp(0.0, 1.0);
-
-    groove * groove * height_factor * dist_factor
+    after_erosion
 }
 
 fn classify_by_field(
@@ -808,7 +1024,7 @@ pub fn generate_section_data(
             let wx = chunk_wx + x as f64;
             let wz = chunk_wz + z as f64;
 
-            let (raw_dist, ridge_elev_val, ridge_cx, ridge_cz) = skeleton.query_elevation(wx, wz, &params);
+            let (raw_dist, _ridge_elev_val, ridge_cx, ridge_cz) = skeleton.query_elevation(wx, wz, &params);
             let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed, settings);
             let elevation = elevation_f as i32;
@@ -822,12 +1038,27 @@ pub fn generate_section_data(
                 wx, wz, field, &skeleton, &params, mtn.width,
             );
 
-            // Сила эрозии для выбора блока поверхности
-            let e_str = erosion_strength(
-                wx, wz, raw_dist, ridge_elev_val,
-                ridge_cx, ridge_cz, &params, seed,
-            );
-            let in_erosion_groove = e_str > 0.15;
+            // Проверка реки
+            let (river_dist, river_width, _river_bed_elev) = skeleton.query_river(wx, wz);
+            let river_half = river_width * 0.5;
+            let in_river = river_dist < river_half;
+            let _near_river_bank = river_dist < river_half + 2.0 && !is_underwater;
+
+            // Сила эрозии для выбора блока поверхности (только горы)
+            let in_erosion_groove = if (zone == CellZone::Highland || zone == CellZone::Mountain)
+                && elevation_f > 15.0
+            {
+                let to_x = wx - ridge_cx;
+                let to_z = wz - ridge_cz;
+                let dist_fr = (to_x * to_x + to_z * to_z).sqrt().max(0.1);
+                let angle = to_z.atan2(to_x);
+                let angular_coord = angle * 12.0;
+                let radial_coord = dist_fr * 0.015;
+                let gn = fbm_noise(angular_coord, radial_coord, seed.wrapping_add(77777), 3);
+                (-gn).max(0.0) > 0.25
+            } else {
+                false
+            };
 
             // Цвет травы: noise + затемнение около деревьев
             let color_noise = fbm_noise(
@@ -874,12 +1105,16 @@ pub fn generate_section_data(
                 let pos = ChunkBlockPosition::new(x, y, z);
 
                 if world_y > top_y && world_y <= base_y {
+                    // Океанская вода
                     section_data.insert(
                         &pos,
                         BlockDataInfo::create(BlockID::Water.id()),
                     );
                 } else if world_y == top_y {
-                    if is_underwater {
+                    if in_river {
+                        // Река: пусто (воздух) -- вода будет на top_y - 1
+                        // На пляже/в океане это позволяет воде протечь
+                    } else if is_underwater {
                         section_data.insert(
                             &pos,
                             BlockDataInfo::create(BlockID::Sand.id()),
@@ -903,7 +1138,19 @@ pub fn generate_section_data(
                         section_data.insert(&pos, block);
                     }
                 } else if world_y >= top_y - 3 {
-                    if is_underwater {
+                    if in_river && world_y == top_y - 1 {
+                        // Вода реки (на 1 блок ниже поверхности)
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Water.id()),
+                        );
+                    } else if in_river && world_y == top_y - 2 {
+                        // Дно реки (виден через воду)
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Sand.id()),
+                        );
+                    } else if is_underwater || in_river {
                         section_data.insert(
                             &pos,
                             BlockDataInfo::create(BlockID::Sandstone.id()),
@@ -974,6 +1221,12 @@ pub fn generate_section_data(
             let (raw_dist, _, _, _) = skeleton.query_elevation(wx, wz, &params);
             let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
             if field <= params.beach_field_threshold {
+                continue;
+            }
+
+            // Не спавним фолидж в реке
+            let (fo_river_dist, fo_river_width, _) = skeleton.query_river(wx, wz);
+            if fo_river_dist < fo_river_width * 0.5 + 2.0 {
                 continue;
             }
 
