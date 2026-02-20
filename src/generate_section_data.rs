@@ -595,7 +595,7 @@ fn compute_elevation(
     seed: u64,
     settings: &GeneratorSettings,
 ) -> f64 {
-    let (raw_dist, ridge_elev, _, _) = skeleton.query_elevation(wx, wz, params);
+    let (raw_dist, ridge_elev, ridge_cx, ridge_cz) = skeleton.query_elevation(wx, wz, params);
     let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
 
     let mtn = &settings.island.mountains;
@@ -642,7 +642,94 @@ fn compute_elevation(
 
     let surface_mod = (hills + detail) * shore_fade;
 
-    base + modifier + surface_mod
+    let total = base + modifier + surface_mod;
+
+    // --- Эрозионные борозды на горах ---
+    // Радиальные канавки, расходящиеся от хребта как кулуары
+    let erosion = if total > 6.0 {
+        let to_x = wx - ridge_cx;
+        let to_z = wz - ridge_cz;
+        let dist_from_ridge = (to_x * to_x + to_z * to_z).sqrt().max(0.1);
+
+        // Угол от хребта - определяет "спицу"
+        let angle = to_z.atan2(to_x);
+
+        // Noise по углу создаёт борозды-кулуары
+        let angular_coord = angle * 12.0;
+        let radial_coord = dist_from_ridge * 0.015;
+
+        let groove_noise = fbm_noise(
+            angular_coord,
+            radial_coord,
+            seed.wrapping_add(77777),
+            3,
+        );
+
+        // Второй слой - мелкие борозды
+        let detail_groove = fbm_noise(
+            angular_coord * 2.5,
+            radial_coord * 3.0,
+            seed.wrapping_add(78888),
+            2,
+        );
+
+        let groove = (-groove_noise).max(0.0) + (-detail_groove).max(0.0) * 0.4;
+
+        // Сила зависит от высоты
+        let height_factor = ((total - 6.0) / 34.0).clamp(0.0, 1.0);
+
+        // Сильнее на склонах, слабее у самой вершины и у подножия
+        let dist_norm = (dist_from_ridge / params.highland_width).clamp(0.0, 1.0);
+        let slope_factor = (dist_norm * 3.0).min(1.0) * (1.0 - dist_norm * 0.5);
+
+        let raw_erosion = groove * height_factor * slope_factor * total * 0.35;
+
+        raw_erosion.min((total - 3.0).max(0.0))
+    } else {
+        0.0
+    };
+
+    total - erosion
+}
+
+/// Сила эрозии в точке (0.0 .. ~1.0). Используется и для высоты, и для выбора блока.
+fn erosion_strength(
+    wx: f64, wz: f64,
+    raw_dist: f64,
+    ridge_elev: f64,
+    ridge_cx: f64, ridge_cz: f64,
+    params: &IslandParams,
+    seed: u64,
+) -> f64 {
+    if ridge_elev <= 15.0 || raw_dist >= params.highland_width {
+        return 0.0;
+    }
+
+    let to_ridge_x = ridge_cx - wx;
+    let to_ridge_z = ridge_cz - wz;
+    let to_ridge_len = (to_ridge_x * to_ridge_x + to_ridge_z * to_ridge_z)
+        .sqrt()
+        .max(1.0);
+
+    let dir_x = to_ridge_x / to_ridge_len;
+    let dir_z = to_ridge_z / to_ridge_len;
+
+    let along = wx * dir_x + wz * dir_z;
+    let across = wx * (-dir_z) + wz * dir_x;
+
+    let erosion_noise = fbm_noise(
+        along * 0.01,
+        across * 0.08,
+        seed.wrapping_add(77777),
+        4,
+    );
+
+    let groove = (-erosion_noise).max(0.0);
+
+    let height_factor = ((ridge_elev - 15.0) / 30.0).clamp(0.0, 1.0);
+    let dist_factor = (1.0 - raw_dist / params.highland_width).clamp(0.0, 1.0);
+
+    groove * groove * height_factor * dist_factor
 }
 
 fn classify_by_field(
@@ -721,7 +808,7 @@ pub fn generate_section_data(
             let wx = chunk_wx + x as f64;
             let wz = chunk_wz + z as f64;
 
-            let (raw_dist, _, _, _) = skeleton.query_elevation(wx, wz, &params);
+            let (raw_dist, ridge_elev_val, ridge_cx, ridge_cz) = skeleton.query_elevation(wx, wz, &params);
             let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
             let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed, settings);
             let elevation = elevation_f as i32;
@@ -734,6 +821,13 @@ pub fn generate_section_data(
             let zone = classify_by_field(
                 wx, wz, field, &skeleton, &params, mtn.width,
             );
+
+            // Сила эрозии для выбора блока поверхности
+            let e_str = erosion_strength(
+                wx, wz, raw_dist, ridge_elev_val,
+                ridge_cx, ridge_cz, &params, seed,
+            );
+            let in_erosion_groove = e_str > 0.15;
 
             // Цвет травы: noise + затемнение около деревьев
             let color_noise = fbm_noise(
@@ -795,6 +889,11 @@ pub fn generate_section_data(
                             &pos,
                             BlockDataInfo::create(border_block(zone, slope)),
                         );
+                    } else if in_erosion_groove {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Cobblestone.id()),
+                        );
                     } else {
                         let (block_id, color) = surface_block(zone, slope, grass_color);
                         let mut block = BlockDataInfo::create(block_id);
@@ -808,6 +907,11 @@ pub fn generate_section_data(
                         section_data.insert(
                             &pos,
                             BlockDataInfo::create(BlockID::Sandstone.id()),
+                        );
+                    } else if in_erosion_groove {
+                        section_data.insert(
+                            &pos,
+                            BlockDataInfo::create(BlockID::Cobblestone.id()),
                         );
                     } else {
                         section_data.insert(
@@ -857,6 +961,129 @@ pub fn generate_section_data(
             section_data.insert(
                 &pos,
                 BlockDataInfo::create(tb.block_id),
+            );
+        }
+    }
+
+    // --- Фолидж: цветы на полях, трава/мох в лесах ---
+    for x in 0..(CHUNK_SIZE as u8) {
+        for z in 0..(CHUNK_SIZE as u8) {
+            let wx = chunk_wx + x as f64;
+            let wz = chunk_wz + z as f64;
+
+            let (raw_dist, _, _, _) = skeleton.query_elevation(wx, wz, &params);
+            let field = island_field(wx, wz, raw_dist, params.land_width, seed, settings);
+            if field <= params.beach_field_threshold {
+                continue;
+            }
+
+            let elevation_f = compute_elevation(wx, wz, &skeleton, &params, seed, settings);
+            let elevation = elevation_f as i32;
+            let surface_y = base_y + elevation + 1;
+
+            if surface_y < section_y_min || surface_y >= section_y_max {
+                continue;
+            }
+
+            let zone = classify_by_field(
+                wx, wz, field, &skeleton, &params, mtn.width,
+            );
+
+            let elev_px = compute_elevation(wx + 1.0, wz, &skeleton, &params, seed, settings);
+            let elev_pz = compute_elevation(wx, wz + 1.0, &skeleton, &params, seed, settings);
+            let slope = ((elev_px - elevation_f).powi(2) + (elev_pz - elevation_f).powi(2)).sqrt();
+
+            // Фолидж только на траве
+            let (surface_id, _) = surface_block(zone, slope, 0);
+            if surface_id != BlockID::Grass.id() {
+                continue;
+            }
+
+            // Хэш для рандома на блок
+            let iwx = wx.floor() as i64;
+            let iwz = wz.floor() as i64;
+            let cell_hash = seed.wrapping_add(55555)
+                ^ (iwx as u64).wrapping_mul(6364136223846793005)
+                ^ (iwz as u64).wrapping_mul(1442695040888963407);
+            let roll = (cell_hash % 1000) as f64 / 1000.0;
+
+            let forest_noise = fbm_noise(
+                wx * 0.025,
+                wz * 0.025,
+                seed.wrapping_add(33333),
+                2,
+            );
+            let in_forest = forest_noise > 0.15 && zone == CellZone::Lowland;
+
+            let foliage_id = if zone != CellZone::Lowland {
+                // Highland/Mountain: просто трава на траве
+                if roll > 0.12 { continue; }
+                match cell_hash % 4 {
+                    0 => BlockID::Grass1.id(),
+                    1 => BlockID::Grass2.id(),
+                    2 => BlockID::Grass3.id(),
+                    _ => BlockID::Grass4.id(),
+                }
+            } else if in_forest {
+                // Лес: только трава, редко
+                let forest_depth = ((forest_noise - 0.15) / 0.35).clamp(0.0, 1.0);
+                if roll > forest_depth * 0.15 { continue; }
+                match cell_hash % 4 {
+                    0 => BlockID::Grass1.id(),
+                    1 => BlockID::Grass2.id(),
+                    2 => BlockID::Grass3.id(),
+                    _ => BlockID::Grass4.id(),
+                }
+            } else {
+                // Поле: отдельные поляны цветов среди травы
+                let field_depth = ((0.15 - forest_noise) / 0.4).clamp(0.0, 1.0);
+
+                // Noise для цветочных полян (крупные пятна)
+                let meadow_noise = fbm_noise(
+                    wx * 0.015,
+                    wz * 0.015,
+                    seed.wrapping_add(66666),
+                    2,
+                );
+                let is_meadow = meadow_noise > 0.15;
+
+                if is_meadow {
+                    // Цветочная поляна -- один вид на всю поляну
+                    let meadow_density = ((meadow_noise - 0.15) / 0.3).clamp(0.0, 1.0);
+                    if roll > meadow_density * field_depth * 0.3 { continue; }
+
+                    // Вид цветка определяется очень крупным noise
+                    let flower_type = fbm_noise(
+                        wx * 0.008,
+                        wz * 0.008,
+                        seed.wrapping_add(88888),
+                        1,
+                    );
+                    let fi = ((flower_type + 0.5) * 5.0).clamp(0.0, 4.99) as u32;
+                    match fi {
+                        0 => BlockID::FlowerWhite.id(),
+                        1 => BlockID::FlowerYellow.id(),
+                        2 => BlockID::FlowerRose.id(),
+                        3 => BlockID::FlowerLupin.id(),
+                        _ => BlockID::FlowerOrchid.id(),
+                    }
+                } else {
+                    // Между полянами -- трава
+                    if roll > field_depth * 0.1 { continue; }
+                    match cell_hash % 4 {
+                        0 => BlockID::Grass1.id(),
+                        1 => BlockID::Grass2.id(),
+                        2 => BlockID::TallGrass1.id(),
+                        _ => BlockID::TallGrass2.id(),
+                    }
+                }
+            };
+
+            let ly = (surface_y - section_y_min) as u8;
+            let pos = ChunkBlockPosition::new(x, ly, z);
+            section_data.insert(
+                &pos,
+                BlockDataInfo::create(foliage_id),
             );
         }
     }
